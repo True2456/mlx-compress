@@ -1,0 +1,17 @@
+.env
+.venv/
+**/__pycache__/
+*.pyc
+.DS_Store
+scripts/hosts.json
+artifacts/**
+!artifacts/.gitkeep
+calib/**
+!calib/.gitkeep
+# never commit multi-hundred-GB weights
+models/**
+!models/.gitkeep
+MiniMax-*/
+*.safetensors
+*.pt
+*.bin

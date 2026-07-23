@@ -1,0 +1,4 @@
+[
+  { "ssh": "m5-max.local" },
+  { "ssh": "m3-max.local" }
+]
