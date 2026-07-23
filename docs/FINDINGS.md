@@ -358,6 +358,58 @@ yes/no redundancy gate. ~40 min vs ~3 h.
 
 ---
 
+## 10b. Perplexity evaluation — two methodology bugs found
+
+Building the first *non-proxy* measurement (`reap_stream/eval_ppl_streamed.py`)
+surfaced two bugs that would have made every PPL number meaningless. Both were
+caught by noticing an implausible result, not by the code failing.
+
+Initial smoke test on 6 held-out prompts gave **agentic PPL = 388** — absurd for a
+frontier model, while `reasoning_math` scored a healthy 3.30. That split was the clue.
+
+| Category | Original | + `head` trunc | + raw text (**correct**) |
+|---|---|---|---|
+| agentic | 388.41 | 220.56 | **10.75** |
+| coding | 42.30 | 42.30 | **9.13** |
+| reasoning_math | 3.30 | 3.17 | **2.55** |
+| **OVERALL** | 42.94 | 33.22 | **6.13** |
+
+**Bug 1 — `headtail` truncation is wrong for perplexity.**
+It's correct for *saliency* (sampling both task setup and answer gives representative
+routing statistics), but for perplexity it splices first-512 onto last-512, creating a
+hard discontinuity mid-sequence. Tokens after that seam are genuinely unpredictable,
+inflating NLL for reasons unrelated to model quality. Agentic prompts (5000–10000
+tokens) are the most truncated, hence worst affected; `reasoning_math` mostly fits
+under 1024 and was untouched. **PPL eval now defaults to `head`** (contiguous prefix).
+
+**Bug 2 — chat-template double-wrapping** (inherited from `_tokenize_prompts`).
+The calib rows already carry their own `SYSTEM:/USER:/ASSISTANT:` structure, but
+`apply_chat_template` wrapped the whole thing *again* as a single user turn:
+```
+<|begin_of_sentence|><|im_start|>user\nSYSTEM:\nYou are a helpful assistant...
+```
+The model receives `SYSTEM:` as literal text inside a user message — a structure it
+never saw in training. This is why agentic (elaborate embedded SYSTEM blocks + function
+schemas) and coding suffered most, while plain `USER:/ASSISTANT:` reasoning_math barely
+moved. Fixing it gave a **36× improvement on agentic**. PPL eval now feeds raw text;
+`--chat-template` opts back in.
+
+> **Does this invalidate the saliency work? No.** Every saliency run used identical
+> treatment, so comparisons *between* them (old vs new plan, text vs vision) remain
+> valid — it's a level shift, not a differential one. It would only have corrupted
+> perplexity, which is exactly where it was caught.
+
+**Eval protocol:** 500 held-out prompts from rows 5000+ (never used in calibration —
+saliency used the first 2500, DWQ the first 1500), multimodal excluded (misaligned and
+imageless, unanswerable as text), `head` truncation at 1024 tokens, raw text, with
+**per-category breakdown** — an aggregate number can hide "coding fine, agentic
+degraded 5%".
+
+Measured BF16 streaming cost: **0.86 s fixed/prompt + 1.13 ms/token** → ~17 min for
+500 prompts. Resident quantized models are far faster (~1–2 min, no per-layer disk reads).
+
+---
+
 ## 11. Method lessons
 
 - **`footprint <pid>`, not MLX counters.** MLX under-reported by >2×.
@@ -372,6 +424,12 @@ yes/no redundancy gate. ~40 min vs ~3 h.
 - **Test the fix, not just the problem.** `tail` truncation and gradient accumulation
   both sounded right and both measured *worse*. Every fix that survived here was
   validated against ground truth first.
-- **Everything above is still a proxy.** No downstream task evaluation has been run on
-  any artifact. Perplexity/benchmark comparison against the unreaped model in the same
-  format remains the real test.
+- **An implausible number is a bug report.** Agentic PPL of 388 wasn't a finding about
+  the model — it was two stacked methodology bugs (§10b). Sanity-check magnitudes
+  against what the quantity *should* look like before interpreting it.
+- **The right setting is task-dependent.** `headtail` is correct for saliency and wrong
+  for perplexity; the same knob flips depending on whether you're sampling routing
+  statistics or modelling a contiguous sequence.
+- **Most numbers here are still proxies.** Perplexity (§10b) is the first non-proxy
+  measurement. Real task benchmarks (SWE-bench, Terminal-Bench — what this model is
+  actually built for) remain unrun.

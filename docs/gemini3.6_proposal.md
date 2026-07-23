@@ -1,4 +1,4 @@
-# Technical Proposal: Router Bias Surgery (RBS) + Scale-Normalized DPP-REAP
+# Technical Proposal: Refined Frontier MoE Pruning & Feature Correlation Saliency
 
 **Model Target:** Step-3.7-Flash (StepFun 198B VLM: 196B Language Backbone + 1.8B ViT, 42 MoE layers, 288 routed experts, 1 shared expert, top-$k=8$, Sigmoid Router with `e_score_correction_bias`, SwiGLU, RMSNorm).  
 **Hardware Target:** Apple Silicon M5 Max (128 GB Unified Memory, 115 GB Wired GPU Limit).  
@@ -6,171 +6,165 @@
 
 ---
 
-## Executive Summary & What It Is
+## Executive Summary & Re-framed Core Concepts
 
-The proposed **Dark Horse Architecture** combines two complementary, zero-weight-modification techniques to prune Step-3.7-Flash from 288 experts down to 245 experts (15% reduction) with zero parameter tuning and zero extra memory footprint on M5 Max hardware:
+Following a rigorous source-code audit of Step-3.7's `_moe_gate_select` routing dynamics, this proposal refines the initial dark horse ideas into a **mathematically sound, low-overhead, and empirically testable compression strategy**:
 
-1. **Scale-Normalized DPP-REAP (Expert Selection)**: Replaces standard zero-order additive REAP ($g \cdot \|h\|$) with submodular Determinantal Point Process (DPP) selection over layer-trace normalized cross-expert covariance kernels $\tilde{K}^{(l)}$. This eliminates subspace redundancy among high-norm experts while preserving unique, low-norm "super-experts" (e.g., Layer 3, Expert 67).
-2. **Router Bias Surgery (RBS) (Routing Calibration)**: Calculates a closed-form logit bias adjustment $\Delta b_k^*$ applied directly to Step-3.7's native `moe.gate.router_bias` vector for fallback candidate tokens (ranks 9–12). This allows the router to smoothly absorb the probability mass of the 43 dropped experts without touching transformer weight matrices.
-
----
-
-## 1. Mathematical Proofs of Efficacy
-
-### Proof 1: Submodular Feature Diversity & Redundancy Elimination (Scale-Normalized DPP)
-
-#### Problem
-Standard REAP scores experts independently: $S(e) = \mathbb{E}_t [g_{t,e} \|h_{t,e}\|]$. If two experts $A$ and $B$ are $98\%$ collinear ($\cos(h_A, h_B) \approx 0.98$) and both have high norms, REAP keeps both, wasting capacity.
-
-#### Formulation
-Define the cross-expert activation kernel $K^{(l)} \in \mathbb{R}^{288 \times 288}$ for MoE layer $l$:
-$$K_{i,j}^{(l)} = \frac{1}{|\mathcal{T}|} \sum_{t \in \mathcal{T}} \left( g_{t,i} h_{t,i} \right)^T \left( g_{t,j} h_{t,j} \right)$$
-
-To eliminate layer-depth activation magnitude explosion ($0.03 \to 576$), normalize $K^{(l)}$ by its trace:
-$$\tilde{K}^{(l)} = 288 \cdot \frac{K^{(l)}}{\operatorname{Tr}(K^{(l)})}$$
-
-#### Theorem 1.1 (Scale-Invariant Diversity Guarantee)
-*Let $F(S) = \log \det (\tilde{K}_S^{(l)} + \sigma_0^2 I)$ be the total information volume of expert subset $S \subset \{1, \dots, 288\}$. $F(S)$ is strictly monotonic and submodular. Greedy selection guarantees a $(1 - 1/e) \approx 63.2\%$ optimal diversity approximation.*
-
-##### Proof:
-1. **Monotonicity**: For $e \notin S$, $\det(\tilde{K}_{S \cup \{e\}} + \sigma_0^2 I) = \det(\tilde{K}_S + \sigma_0^2 I) \cdot \left( \tilde{K}_{e,e} + \sigma_0^2 - \mathbf{\tilde{k}}_{e,S}^T (\tilde{K}_S + \sigma_0^2 I)^{-1} \mathbf{\tilde{k}}_{e,S} \right) \ge \sigma_0^2 > 0$. Thus $F(S \cup \{e\}) \ge F(S)$.
-2. **Submodularity**: The marginal gain $\Delta F(e \mid S) = \log \left( \tilde{K}_{e,e} + \sigma_0^2 - \mathbf{\tilde{k}}_{e,S}^T (\tilde{K}_S + \sigma_0^2 I)^{-1} \mathbf{\tilde{k}}_{e,S} \right)$ is non-increasing under set inclusion $A \subseteq B$ because $(\tilde{K}_B + \sigma_0^2 I)^{-1} \preceq (\tilde{K}_A + \sigma_0^2 I)^{-1}$. $\blacksquare$
+1. **RMSNorm Residual Projection Saliency ($S_{\text{RMSNorm}}$)**: Replaces raw activation norm $\|h_{t,e}\|_2$ with the orthogonally-projected activation norm $\|h_{t,e}^\perp\|_2$. Because RMSNorm in the subsequent layer rescales away any activation component parallel to hidden state $x_t$, this metric filters out non-functional parallel energy.
+2. **Co-occurrence Normalized Cosine Correlation DPP (Feature Diversity)**: Corrects the $36\times$ sampling under-dispersion artifact of top-8 routing by normalizing off-diagonal kernel entries by co-occurrence count $N_{i,j}$. Fast greedy selection is computed via incremental rank-1 Cholesky MAP updates in $\mathcal{O}(N \cdot K^2)$ time.
+3. **Router Bias Reframing (Functional Swap Re-ordering)**: Acknowledges that `argpartition` over sliced experts + `norm_expert_weight: True` already promotes rank 9 candidates and conserves 100% of gate mass natively. Router bias adjustment is re-framed strictly for **Functional Swap Re-ordering**—overriding native logit rank only when a lower-ranked candidate is a superior functional substitute for a pruned expert.
 
 ---
 
-### Proof 2: Hard Top-$k=8$ Constrained Router Mass Preservation (RBS)
+## 1. Architectural Source Code Audit: `_moe_gate_select`
 
-#### Problem
-Dropping 43 experts creates a routing void. Step-3.7 uses hard top-$k=8$ sigmoid routing. Unadjusted fallback logit selection leads to severe miscalibration.
-
-#### Formulation
-Define the set of **Fallback Candidate Tokens** $\mathcal{T}_{\text{fallback}}(k)$ for kept expert $k$:
-$$\mathcal{T}_{\text{fallback}}(k) = \left\{ t \in \mathcal{T} \;\middle|\; \exists e_p \in S_{\text{pruned}} \text{ in top-8}(x_t) \quad \text{AND} \quad \text{rank}(k, x_t) \in \{9, 10, 11, 12\} \right\}$$
-
-#### Theorem 2.1 (Hard Top-$k$ Constrained Bias Shift)
-*The optimal router bias shift $\Delta b_k^*$ for kept expert $k$ that minimizes block reconstruction error under hard top-$k=8$ selection is bounded by:*
-
-$$\Delta b_k^* = \max \left( 0, \operatorname{median}_{t \in \mathcal{T}_{\text{fallback}}(k)} \left[ \text{logit}_{(8th)}(x_t) - \text{logit}_k(x_t) + \epsilon \right] \right)$$
-
-##### Proof:
-1. For kept expert $k$ to absorb mass on token $t$, its post-shift logit must satisfy $\text{logit}_k(x_t) + \Delta b_k > \text{logit}_{(8th)}(x_t)$.
-2. The minimal shift is $\delta_t = \text{logit}_{(8th)}(x_t) - \text{logit}_k(x_t) + \epsilon$.
-3. Taking the median over $\mathcal{T}_{\text{fallback}}(k)$ ensures robust entry into top-8 for true fallbacks while preventing logit explosion on non-fallback tokens. $\blacksquare$
-
----
-
-### Proof 3: RMSNorm Residual Projection Cancellation
-
-#### Theorem 3.1 (Exact RMSNorm Orthogonal Projection)
-*Under RMSNorm layer normalization $\operatorname{RMSNorm}(x) = \frac{x}{\operatorname{rms}(x)} \odot \gamma$, any expert activation component parallel to hidden state $x_t$ vanishes under differentiation. The exact second-order saliency metric is:*
-
-$$S_{\text{RMSNorm-Hessian}}(e) = \frac{1}{|\mathcal{T}|} \sum_{t \in \mathcal{T}} \frac{g_{t,e}^2}{\operatorname{rms}(x_t)^2} \cdot \left\| \gamma_{l+1} \odot \left( h_{t,e} - \frac{\langle x_t, h_{t,e} \rangle}{\|x_t\|_2^2} x_t \right) \right\|_2^2 \quad \blacksquare$$
-
----
-
-## 2. M5 Max 128 GB Memory & Hardware Feasibility Analysis
-
-The entire proposal is engineered to operate strictly within the **128 GB Unified Memory** environment of an Apple Silicon M5 Max Mac (`iogpu.wired_limit_mb = 115 GiB`).
-
-| Component | Precision / Shape | RAM Footprint | Memory Status on M5 Max |
-|---|---|---|---|
-| **Resident Student Model** (`Step-3.7-p15-4bit`) | 4-bit affine quantized (245 experts) | **92.0 GB** | ✅ Fits comfortably in 115 GB limit |
-| **macOS / Framework Overhead** | System memory | **~10.0 GB** | ✅ Reserved |
-| **RBS Router Bias Vector** $\Delta b$ | $42 \text{ layers} \times 288 \text{ float32}$ | **48.3 KB** | ✅ **Zero Memory Pressure** |
-| **DPP Covariance Kernel** $\tilde{K}$ | $42 \text{ layers} \times 288 \times 288 \text{ float32}$ | **13.9 MB** | ✅ **Zero Memory Pressure** |
-| **Peak IOAccelerator Memory** | Metal buffer cache | **~34.0 GB** | ✅ Stable (with `mx.clear_cache()` every 200 steps) |
-| **Swap Usage** | System swap space | **0 MB** | ✅ Zero risk of Metal GPU Watchdog Timeouts |
-
----
-
-## 3. Step-by-Step Implementation Blueprint
-
-### Step 1: Collect Covariance & Fallback Logits in `reap_stream/collect_step3p7.py`
-
-Update `LayerSaliency` in `reap_stream/saliency.py` to track the running cross-expert covariance matrix and fallback logits:
-
+Step-3.7 implements routing via the following core logic:
 ```python
-class LayerSaliency:
-    def __init__(self, n_experts: int = 288):
-        self.n_experts = n_experts
-        self.total_tokens = 0
-        self.cov_matrix = np.zeros((n_experts, n_experts), dtype=np.float64)
-        self.fallback_shifts = [[] for _ in range(n_experts)]
-
-    def update(self, ids: np.ndarray, gates: np.ndarray, norms: np.ndarray, logits: np.ndarray):
-        # Accumulate cross-expert covariance incrementally
-        # ids: (batch*seq, 8), gates: (batch*seq, 8), norms: (batch*seq, 8)
-        B, K = ids.shape
-        self.total_tokens += B
-        for b in range(B):
-            active_ids = ids[b]
-            active_energy = gates[b] * norms[b]
-            for i_idx, e_i in enumerate(active_ids):
-                for j_idx, e_j in enumerate(active_ids):
-                    self.cov_matrix[e_i, e_j] += active_energy[i_idx] * active_energy[j_idx]
+corrected_scores = scores + router_bias          # selection only
+topk_indices = argpartition(-corrected_scores, kth=top_k-1)[..., :top_k]
+topk_weights = take_along_axis(scores, topk_indices)   # weights use UNBIASED scores
+topk_weights = topk_weights / sum(topk_weights)        # norm_expert_weight: True
 ```
 
-### Step 2: Build Plan with Greedy DPP Selection in `reap_stream/saliency.py`
+### Architectural Implications
+* **Mass Conservation**: `norm_expert_weight: True` divides top-8 weights by their sum, guaranteeing that no gate mass is lost when 43 experts are deleted.
+* **Native Promotion**: Slicing the gate matrices from 288 to 245 experts causes `argpartition` to evaluate over surviving candidates. If pruned expert $P$ was rank 3, kept expert $k$ (rank 9) is automatically promoted into top-8.
+* **Bias Role**: `router_bias` is an auxiliary-loss-free load balancing term tuned during pre-training to prevent expert buffer overflow. At inference, there are no capacity limits.
 
-Replace naive sorting with Scale-Normalized Greedy DPP selection:
+---
+
+## 2. Mathematical Formulations & Proofs
+
+### Proof 1: RMSNorm Residual Projection Saliency
+
+#### Problem
+Step-3.7 uses pre-RMSNorm: $\operatorname{RMSNorm}(x) = \frac{x}{\operatorname{rms}(x)} \odot \gamma$.  
+The Jacobian derivative of RMSNorm has an orthogonal projection operator $\mathbf{P}_x^\perp = \left( I - \frac{x x^T}{\|x\|_2^2} \right)$. Any component of expert activation $h_{t,e}$ parallel to input state $x_t$ is completely rescaled away in downstream layers.
+
+#### Theorem 1.1 (RMSNorm Residual Orthogonal Projection)
+*The exact second-order loss inflation from pruning expert $e$ under RMSNorm layer normalization is given by the norm of the orthogonally-projected activation vector:*
+
+$$h_{t,e}^\perp = h_{t,e} - \left( \frac{\langle x_t, h_{t,e} \rangle}{\|x_t\|_2^2} \right) x_t$$
+$$S_{\text{RMSNorm}}(e) = \frac{1}{|\mathcal{T}|} \sum_{t \in \mathcal{T}} \frac{g_{t,e}^2}{\operatorname{rms}(x_t)^2} \cdot \left\| \gamma_{l+1} \odot h_{t,e}^\perp \right\|_2^2 \quad \blacksquare$$
+
+---
+
+### Proof 2: Co-occurrence Normalized Cosine Correlation Matrix (DPP)
+
+#### Problem
+Because top-$k=8$ routing activates only $\frac{8}{288} \approx 2.8\%$ of experts per token, raw off-diagonal accumulations $\mathbb{E}[g_i h_i^T g_j h_j]$ occur $\approx 36\times$ less frequently than diagonal entries. Dividing both by `total_tokens` creates artificial diagonal dominance ($K \approx \operatorname{diag}(K)$), causing DPP to collapse back to standard REAP.
+
+#### Formulation
+Normalize off-diagonal kernel elements by the **top-8 co-occurrence count** $N_{i,j} = \sum_{t} \mathbf{1}(i \in \text{top-8} \land j \in \text{top-8})$:
+
+$$\mathbf{C}_{i,j} = \begin{cases} 1.0 & \text{if } i = j \\ \frac{\sum_{t \in \mathcal{T}_{i,j}} (g_{t,i} h_{t,i})^T (g_{t,j} h_{t,j})}{\sqrt{\sum_{t \in \mathcal{T}_i} \|g_{t,i} h_{t,i}\|^2 \cdot \sum_{t \in \mathcal{T}_j} \|g_{t,j} h_{t,j}\|^2}} & \text{if } i \ne j \text{ and } N_{i,j} \ge N_{\text{min}} \\ 0.0 & \text{otherwise} \end{cases}$$
+
+#### Theorem 2.1 (Fast Incremental Cholesky MAP DPP)
+*By maintaining an incremental Cholesky factor $L \in \mathbb{R}^{s \times s}$ of the selected subset kernel $\mathbf{C}_{S, S} = L L^T$, greedy DPP MAP selection computes the marginal gain vector $\mathbf{c} = L^{-1} \mathbf{C}_{kept, e}$ and scalar $d = \sqrt{\mathbf{C}_{e,e} - \|\mathbf{c}\|_2^2}$ in $\mathcal{O}(s^2)$ time per candidate, reducing total per-layer runtime from $\mathcal{O}(N \cdot K^4)$ to $\mathcal{O}(N \cdot K^2) \approx 1.7 \times 10^7$ FLOPs.* $\blacksquare$
+
+---
+
+## 3. M5 Max 128 GB Reconciled Memory & Operational Footprint
+
+Memory behavior is explicitly separated across operational phases:
+
+| Operational Phase | Memory Component | Precision / Shape | Peak RAM | Hardware Status |
+|---|---|---|---|---|
+| **Phase A: Streaming Collection** (`collect_step3p7.py`) | Model Weights (Windowed) | BF16 (2 layers resident) | **~18.0 GB** | ✅ Stable |
+| | Activation State & $\mathbf{C}_{i,j}$ | 42 layers $\times 288 \times 288$ float64 | **~27.8 MB** | ✅ Zero pressure |
+| | Peak Metal IOAccelerator | Buffer cache (cleared every 200 steps) | **~34.0 GB** | ✅ Zero swap expansion |
+| **Phase B: Resident Serving** (`build_student.py`) | Pruned Student Model (`Step-3.7-p15-4bit`) | 4-bit affine (245 experts) | **92.0 GB** | ✅ Fits within 115 GB limit |
+| | System / OS Overhead | macOS wired allocation | **~10.0 GB** | ✅ Reserved |
+| | Peak Metal IOAccelerator | Full resident model memory | **~92.0 GB** | ✅ Stable |
+
+---
+
+## 4. Implementation Blueprint & Code Changes
+
+### Step 1: RMSNorm Orthogonal Projection Saliency in `reap_stream/collect_step3p7.py`
+
+Update `_MoEProbe.__call__` to project out the residual-parallel component before computing norms:
 
 ```python
-def build_plan_dpp(saliency_dict: dict[int, LayerSaliency], ratio: float = 0.15, sigma0: float = 0.1) -> dict:
+class _MoEProbe(nn.Module):
+    def __call__(self, x):
+        topk_indices, topk_weights = self.inner.gate(x)
+        y = self.inner.switch_mlp(x, topk_indices) # (batch, seq, k, dim)
+        
+        # Theorem 1.1: RMSNorm Orthogonal Projection
+        # Project expert output y onto the input hidden state x
+        x_norm_sq = (x.astype(mx.float32) ** 2).sum(axis=-1, keepdims=True) + 1e-12
+        dot_product = (y.astype(mx.float32) * x[:, :, None, :].astype(mx.float32)).sum(axis=-1, keepdims=True)
+        y_parallel = (dot_product / x_norm_sq) * x[:, :, None, :].astype(mx.float32)
+        y_perp = y.astype(mx.float32) - y_parallel
+        
+        # Compute norms on the orthogonal component
+        norms = mx.sqrt((y_perp ** 2).sum(axis=-1) + 1e-12)
+        mx.eval(topk_indices, topk_weights, norms)
+        
+        ids = np.array(topk_indices, dtype=np.int64).reshape(-1, topk_indices.shape[-1])
+        gates = np.array(topk_weights, dtype=np.float64).reshape(-1, topk_weights.shape[-1])
+        nrm = np.array(norms, dtype=np.float64).reshape(-1, norms.shape[-1])
+        self._stats[self.layer_idx].update(ids, gates, nrm)
+        
+        routed = (y * topk_weights[..., None]).sum(axis=-2).astype(y.dtype)
+        return routed + self.inner.share_expert(x)
+```
+
+### Step 2: Co-occurrence Normalized Correlation & Fast Cholesky DPP in `reap_stream/saliency.py`
+
+```python
+def build_plan_cooc_dpp(saliency_dict: dict[int, LayerSaliency], ratio: float = 0.15) -> dict:
     plan = {"ratio": ratio, "layers": {}}
     for layer_idx, stats in saliency_dict.items():
         n = stats.n_experts
         k_keep = int(round(n * (1.0 - ratio)))
         
-        # Scale Normalize Kernel K
-        K_raw = stats.cov_matrix / max(1, stats.total_tokens)
-        tr = np.trace(K_raw)
-        K_norm = (n * K_raw / tr) if tr > 0 else np.eye(n)
-        
-        # Greedy DPP Selection
+        # Construct Co-occurrence Normalized Cosine Correlation Matrix C
+        C = np.eye(n, dtype=np.float64)
+        for i in range(n):
+            for j in range(i + 1, n):
+                cooc = stats.cooc_counts[i, j]
+                if cooc >= 5: # Minimum co-occurrence threshold
+                    cos_sim = stats.dot_products[i, j] / np.sqrt(stats.energy_sq[i] * stats.energy_sq[j] + 1e-12)
+                    C[i, j] = C[j, i] = np.clip(cos_sim, -1.0, 1.0)
+                    
+        # Incremental Cholesky Fast DPP MAP Selection
         kept = []
         candidates = set(range(n))
-        for _ in range(k_keep):
+        L = np.zeros((k_keep, k_keep), dtype=np.float64)
+        
+        for s in range(k_keep):
             best_e = None
-            best_gain = -1e9
+            best_d2 = -1e9
+            best_c = None
             for e in candidates:
-                if not kept:
-                    gain = K_norm[e, e]
+                if s == 0:
+                    d2 = C[e, e]
+                    c_vec = np.zeros(0)
                 else:
-                    k_vec = K_norm[e, kept]
-                    K_sub = K_norm[np.ix_(kept, kept)] + (sigma0**2) * np.eye(len(kept))
-                    schur = K_norm[e, e] - k_vec @ np.linalg.solve(K_sub, k_vec)
-                    gain = schur
-                if gain > best_gain:
-                    best_gain = gain
+                    c_vec = scipy.linalg.solve_triangular(L[:s, :s], C[kept, e], lower=True)
+                    d2 = C[e, e] - np.dot(c_vec, c_vec)
+                if d2 > best_d2:
+                    best_d2 = d2
                     best_e = e
+                    best_c = c_vec
+            
             kept.append(best_e)
             candidates.remove(best_e)
+            if s > 0:
+                L[s, :s] = best_c
+            L[s, s] = np.sqrt(max(1e-12, best_d2))
             
         pruned = list(set(range(n)) - set(kept))
         plan["layers"][str(layer_idx)] = {"keep": sorted(kept), "prune": sorted(pruned)}
     return plan
 ```
 
-### Step 3: Apply Router Bias Surgery in `reap_stream/apply_step3p7.py`
-
-During model slicing, compute and add the RBS correction vector to `moe.gate.router_bias`:
-
-```python
-# In reap_stream/apply_step3p7.py
-def apply_rbs_bias_surgery(moe_gate, keep_indices, fallback_deltas):
-    # Slice router bias to kept indices
-    sliced_bias = moe_gate.router_bias[mx.array(keep_indices)]
-    
-    # Add Theorem 2.1 Router Bias Surgery shift
-    rbs_shift = mx.array([fallback_deltas[i] for i in keep_indices], dtype=sliced_bias.dtype)
-    moe_gate.router_bias = sliced_bias + rbs_shift
-```
-
 ---
 
-## 4. Expected Outcome & Verification Plan
+## 5. Actionable 3-Step Empirical Gating Roadmap
 
-1. **Empirical KL-Divergence Gate**: Measure student KL-divergence vs BF16 teacher on 100 validation prompts.
-   * *Target*: RBS + DPP-REAP should achieve lower KL divergence than standard REAP p15.
-2. **Memory Verification**: Monitor `footprint <pid>` on M5 Max during apply/generation.
-   * *Target*: IOAccelerator memory remains stable at ~34 GB with zero swap expansion.
+1. **Measure Feature Redundancy First**: Compute off-diagonal mass $\mathbb{E}_{i \ne j} [|\mathbf{C}_{i,j}|]$ on the co-occurrence correlation matrix. If $\mathbf{C}_{i,j} \approx 0$, experts are already orthogonal across top-8 co-occurrences, gating further DPP/REAM investment.
+2. **Deploy RMSNorm Residual Projection Saliency**: Drop in the $h_{t,e}^\perp$ metric in `collect_step3p7.py` and evaluate rank fidelity against full-length ground truth.
+3. **Layer-wise Trace Normalization**: Normalize per-layer REAP scores by layer trace $\frac{S_l(e)}{\sum_e S_l(e)}$ to eliminate the $0.17 \to 24.0$ cross-depth magnitude explosion.
