@@ -175,11 +175,19 @@ def main():
     ap.add_argument("--stream", action="store_true",
                     help="stream decoder blocks (for BF16 / too-large models)")
     ap.add_argument("--layers-at-once", type=int, default=2)
+    ap.add_argument("--adapter-path", default=None,
+                    help="optional LoRA adapter dir to load on top of the base "
+                         "model (forgetting check vs the un-adapted baseline)")
     a = ap.parse_args()
 
     t0 = time.time()
-    print(f"[ppl] loading {a.model} (lazy={a.stream})", flush=True)
-    model, processor = load(a.model, lazy=a.stream)
+    from .tiered import maybe_patch_tiered
+    if maybe_patch_tiered(a.model):
+        print("[ppl] tiered-bank model detected, MoE class patched", flush=True)
+    print(f"[ppl] loading {a.model} (lazy={a.stream})"
+          + (f" +adapter {a.adapter_path}" if a.adapter_path else ""), flush=True)
+    load_kwargs = {"adapter_path": a.adapter_path} if a.adapter_path else {}
+    model, processor = load(a.model, lazy=a.stream, **load_kwargs)
     tok = getattr(processor, "tokenizer", processor)
 
     rows = load_rows(a.dataset, a.start_row, a.n_prompts, a.max_tokens,

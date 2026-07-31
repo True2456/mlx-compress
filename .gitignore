@@ -15,3 +15,10 @@ MiniMax-*/
 *.safetensors
 *.pt
 *.bin
+# training-run artifacts: checkpoints, downloaded trajectory data, run logs
+adapters/**
+!adapters/.gitkeep
+data/**
+!data/.gitkeep
+logs/**
+!logs/.gitkeep

@@ -8,71 +8,87 @@ Uploads:
 """
 import os
 import sys
+import time
 import argparse
 from pathlib import Path
-from huggingface_hub import HfApi, create_repo
+from huggingface_hub import HfApi, create_repo, get_token
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Upload REAP Winner & Artifacts to Hugging Face")
     parser.add_argument("--winner-dir", type=str, required=True, help="Path to the winning pruned model directory")
     parser.add_argument("--repo-name", type=str, required=True, help="Target Hugging Face repo name (e.g. True2456/Step-3.7-Flash-REAP-p15)")
-    parser.add_argument("--artifacts-dir", type=str, default="artifacts/reap_run", help="Path to saliency and plan JSONs")
-    parser.add_argument("--private", action="store_true", default=True, help="Set repo to private (default: True)")
+    parser.add_argument("--artifacts-dir", type=str, default=None,
+                         help="Optional: path to saliency/plan JSONs to upload as a companion repo. "
+                              "Skipped if not given.")
+    parser.add_argument("--public", action="store_true",
+                         help="Make the repo public. Default is private.")
     return parser.parse_args()
 
-def upload_model_variant(api: HfApi, folder_path: Path, repo_name: str, token: str, private: bool = True):
-    """Uploads a single model variant folder to Hugging Face Hub."""
+def upload_model_variant(api: HfApi, folder_path: Path, repo_name: str, token: str,
+                          private: bool = True, max_retries: int = 5) -> bool:
+    """Uploads a single model variant folder to Hugging Face Hub. Returns
+    True on confirmed success, False otherwise -- caller must check this,
+    the exception is swallowed here so one bad file doesn't kill retries."""
     if not folder_path.exists():
         print(f"⚠️ Warning: Directory {folder_path} does not exist. Skipping.")
-        return
+        return False
 
     print(f"🚀 Creating & uploading repo: {repo_name}...")
-    try:
-        create_repo(repo_id=repo_name, private=private, exist_ok=True, token=token)
-        api.upload_folder(
-            folder_path=str(folder_path),
-            repo_id=repo_name,
-            repo_type="model",
-            token=token
-        )
-        print(f"🎉 Successfully uploaded variant to https://huggingface.co/{repo_name}")
-    except Exception as e:
-        print(f"❌ Error uploading {repo_name}: {e}")
+    create_repo(repo_id=repo_name, private=private, exist_ok=True, token=token)
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            api.upload_folder(
+                folder_path=str(folder_path),
+                repo_id=repo_name,
+                repo_type="model",
+                token=token,
+            )
+            print(f"🎉 Successfully uploaded variant to https://huggingface.co/{repo_name}")
+            return True
+        except Exception as e:
+            wait = min(60, 5 * attempt)
+            print(f"⚠️ Attempt {attempt}/{max_retries} failed: {e}")
+            if attempt < max_retries:
+                print(f"   Retrying in {wait}s (already-uploaded content is content-addressed "
+                      f"and won't be re-sent)...")
+                time.sleep(wait)
+            else:
+                print(f"❌ Giving up after {max_retries} attempts uploading {repo_name}.")
+                return False
 
 def main():
     args = parse_args()
-    token = os.environ.get("HF_TOKEN")
+    # HF_TOKEN env var if set, else fall back to `hf auth login`'s cached token.
+    token = os.environ.get("HF_TOKEN") or get_token()
     if not token:
-        print("❌ Error: HF_TOKEN environment variable not found.")
+        print("❌ Error: not authenticated. Run `hf auth login` or set HF_TOKEN.")
         sys.exit(1)
 
     api = HfApi(token=token)
+    private = not args.public
 
     print("=" * 65)
-    print(f"Uploading REAP Model Weights & Artifacts to Hugging Face")
+    print(f"Uploading REAP Model Weights to Hugging Face (private={private})")
     print("=" * 65)
 
     winner_path = Path(args.winner_dir)
-    upload_model_variant(api, winner_path, args.repo_name, token, args.private)
+    ok = upload_model_variant(api, winner_path, args.repo_name, token, private)
 
-    # Upload Artifacts (Saliency & Plans)
-    artifacts_repo = f"{args.repo_name.split('/')[0]}/Step-3.7-Flash-REAP-artifacts"
-    try:
-        create_repo(repo_id=artifacts_repo, private=args.private, exist_ok=True, token=token)
-        print(f"🚀 Uploading saliency profiles and plan JSONs to {artifacts_repo}...")
-        api.upload_folder(
-            folder_path=args.artifacts_dir,
-            repo_id=artifacts_repo,
-            repo_type="model",
-            token=token
-        )
-        print(f"🎉 Artifacts successfully uploaded to https://huggingface.co/{artifacts_repo}")
-    except Exception as e:
-        print(f"⚠️ Warning uploading artifacts: {e}")
+    artifacts_ok = True
+    if args.artifacts_dir:
+        artifacts_repo = f"{args.repo_name.split('/')[0]}/Step-3.7-Flash-REAP-artifacts"
+        artifacts_ok = upload_model_variant(api, Path(args.artifacts_dir), artifacts_repo, token, private)
 
     print("\n" + "=" * 65)
-    print("✅ Hugging Face Upload Complete! Ready to shut down GPU VM.")
-    print("=" * 65)
+    if ok and artifacts_ok:
+        print(f"✅ Upload confirmed complete: https://huggingface.co/{args.repo_name}")
+        print("=" * 65)
+        sys.exit(0)
+    else:
+        print("❌ Upload did NOT complete successfully -- see errors above.")
+        print("=" * 65)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

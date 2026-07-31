@@ -20,6 +20,7 @@ import argparse
 import glob
 import json
 import shutil
+import sys
 from pathlib import Path
 
 import mlx.core as mx
@@ -42,6 +43,10 @@ def _slice_first_dim(module, keep_idx, names=("weight", "scales", "biases", "bia
     for name in names:
         if name in module and module[name] is not None:
             module[name] = module[name][keep_idx]
+
+
+
+
 
 
 def apply_and_quantize(model_path, plan_path, out_dir, bits, group_size, mode):
@@ -114,7 +119,19 @@ def apply_and_quantize(model_path, plan_path, out_dir, bits, group_size, mode):
                 shutil.rmtree(dest)
             shutil.copytree(item, dest)
 
+    # CORRECTED 2026-07-26 (see docs/TOKENIZER-INVESTIGATION.md's correction
+    # section): the earlier comment here was wrong. save_pretrained() below
+    # persists whatever tokenizer_class transformers resolved this tokenizer
+    # to, which is "LlamaTokenizerFast" -- a KNOWN architecture name that
+    # makes AutoTokenizer.from_pretrained() (what mlx_lm/LM Studio actually
+    # calls) apply Llama's own hardcoded SentencePiece/Metaspace conversion
+    # recipe instead of reading this model's real, correct, custom
+    # pretokenizer from tokenizer.json. fix_tokenizer_class() removes that
+    # misleading class declaration and verifies the fix live.
     processor.save_pretrained(out_dir)
+    sys.path.insert(0, str(Path(__file__).parent))
+    from fix_tokenizer_class import fix_tokenizer_class
+    fix_tokenizer_class(out_dir)
     save_config(config, config_path=out_dir / "config.json")
     print(f"[OK] student written: {new_n} experts/layer, {bits}-bit {mode}")
 

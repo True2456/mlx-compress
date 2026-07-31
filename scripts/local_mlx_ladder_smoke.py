@@ -20,6 +20,9 @@ from mlx_vlm import load
 from mlx_vlm.models.base import create_attention_mask
 
 ROOT = Path(__file__).resolve().parents[1]
+# NOTE: this checkpoint was deleted 2026-07-25 to reclaim disk. It is public
+# at mlx-community/Step-3.7-Flash-148B-MLX (81 GB) if this smoke is needed
+# again -- a *different* REAP (212/288 experts, nvfp4), not our build.
 MODEL = Path.home() / ".lmstudio/models/mlx-community/Step-3.7-Flash-148B-MLX"
 OUT = ROOT / "artifacts" / "local-mlx-ladder-smoke"
 CALIB = ROOT / "calib" / "cloud_reap_8k.jsonl"

@@ -1,92 +1,108 @@
-# LLM REAP & Frontier MoE Workspace
+# LLM REAP Workspace
 
-Layer-by-layer **REAP** (Router-weighted Expert Activation Pruning) and frontier MoE compression research for **MiniMax-M2/M2.7** and **Step-3.7-Flash** (198B VLM, 288 experts, top-$k=8$), built on [CerebrasResearch/reap](https://github.com/CerebrasResearch/reap) with local Apple Silicon MLX streaming pipelines.
+Layer-by-layer **REAP** (Router-weighted Expert Activation Pruning) for frontier MoE models, built on [CerebrasResearch/reap](https://github.com/CerebrasResearch/reap) with MiniMax-M2/M2.7 patches.
 
----
-
-## What's Here
+## What's here
 
 | Path | Purpose |
 |------|---------|
-| `reap_stream/` | Local Mac streaming collector, plan generator, student builder (`Step-3.7-Flash`) |
 | `vendor/cerebras-reap/` | Upstream REAP + MiniMax-M2 support patches |
-| `models/` | Local checkpoints (Step-3.7-Flash, MiniMax-M2.7) |
-| `docs/` | Research findings, mathematical audits, and technical proposals |
-| `artifacts/` | Collected saliencies, plans, diagnostic logs, and pruned student builds |
-| `calib/` | Multi-dataset calibration mixes (agentic, coding, math, reasoning, fixed multimodal) |
+| `models/` | Local checkpoints (symlink to `MiniMax-M2.7-172B-BF16`) |
+| `scripts/` | Setup + layer-wise prune launchers |
+| `artifacts/` | Observations, plans, pruned outputs |
+| `calib/cerebras_reap_mix.jsonl` | Cerebras agentic 6-way mix (24,576 rows) |
 
----
+## Current checkpoint
 
-## Research & Documentation
+`MiniMax-M2.7-172B-BF16` is already a **25% REAP** of MiniMax-M2.7:
 
-Comprehensive analysis and mathematical derivations are available in `docs/`:
+- 192 experts / layer (from 256)
+- 62 layers, top-k=8, ~172B BF16 (~321 GB on disk)
 
-* 📄 [docs/step37-reap-dwq-summary.md](file:///Users/true/Desktop/LLM%20-%20Reap/docs/step37-reap-dwq-summary.md): Full session summary on Step-3.7 REAP, 4-bit affine/nvfp4 quantization, DWQ distillation lessons, and MLX memory optimizations (`mx.clear_cache()`).
-* 📄 [docs/step37-reap-findings.md](file:///Users/true/Desktop/LLM%20-%20Reap/docs/step37-reap-findings.md): Saliency observations (zero dead experts, local Jaccard ~0.12, 15% REAP keep-245 decision).
-* 📄 [docs/frontier-moe-pruning-theorems.md](file:///Users/true/Desktop/LLM%20-%20Reap/docs/frontier-moe-pruning-theorems.md): Mathematical derivations and proofs for 6 frontier "dark horse" MoE algorithms.
-* 📄 [docs/frontier-moe-theorems-audit.md](file:///Users/true/Desktop/LLM%20-%20Reap/docs/frontier-moe-theorems-audit.md): Stress-test audit, edge-case corrections (SwiGLU, RMSNorm projection cancellation, top-8 hard thresholding bounds), and official Step-3.7 paper spec cross-check.
-* 📄 [docs/gemini3.6_proposal.md](file:///Users/true/Desktop/LLM%20-%20Reap/docs/gemini3.6_proposal.md): Proposal for Router Bias Surgery + Scale-Normalized DPP-REAP, M5 Max 128 GB memory analysis, and technical counter-critique.
+To prune the **full** 230B (256 experts), put `MiniMaxAI/MiniMax-M2.7` BF16 under `models/` and point `MODEL_PATH` at it.
 
----
+## Hardware requirements
 
-## Models & Targets
+Layer-wise REAP (`python -m reap.layerwise_prune`) keeps the full model on **CPU RAM** and moves **one transformer block** to GPU at a time.
 
-### 1. Step-3.7-Flash (StepFun 198B VLM)
-- **Architecture**: 45 layers (42 MoE layers, dense 0–2), 288 routed experts + 1 shared expert per MoE layer, top-$k=8$ sigmoid routing with `e_score_correction_bias` (`router_bias`), SwiGLU, RMSNorm.
-- **Base Checkpoint**: `models/Step-3.7-Flash` (375 GB BF16).
-- **Pruned 15% Student**: `models/Step-3.7-p15-4bit` (92 GB 4-bit affine, 245 experts/layer, vision tower BF16).
+| Need | Why |
+|------|-----|
+| NVIDIA GPU (H100/H200/A100 class) | Calibration + prune apply |
+| Host RAM ≥ model size | Full BF16 must fit on CPU (~320–450 GB for MiniMax-M2.7) |
+| Free disk ≥ 1× model size | Pruned checkpoint write |
 
-### 2. MiniMax-M2.7-172B-BF16
-- **Architecture**: 62 layers, 192 experts/layer (25% REAP of 256-expert 230B base), top-$k=8$.
+This Mac (M5 Max, 128 GB) **cannot** run MiniMax layer-wise REAP locally. Use HF Jobs / DGX / multi-GPU host (same pattern as `quantize-nvfp4-gb10-agentic.py`).
 
----
+## Quick start (GPU host)
 
-## Hardware Requirements & Mac Streaming (M5 Max 128 GB)
-
-Layer-wise REAP (`reap_stream`) streams one block window resident in GPU RAM at a time while carrying hidden states across windows, allowing full 198B MoE saliency collection on an **M5 Max Mac (128 GB RAM)**.
-
-| Component | Precision / Shape | RAM Footprint | Memory Status |
-|---|---|---|---|
-| **Resident 15% Student** (`Step-3.7-p15-4bit`) | 4-bit affine (245 experts) | **92.0 GB** | Fits within 115 GB wired GPU limit |
-| **Streaming Saliency Collector** | Layerwise block streaming | **~34.0 GB** | Optimized via `mx.clear_cache()` every 200 steps |
-| **System Overhead** | macOS system memory | **~10.0 GB** | Reserved |
-
----
-
-## Quick Start (Mac MLX Streaming REAP)
-
-### 1. Run Corrected Saliency Collection (`headtail` 1024 tokens)
 ```bash
+# 1) Build Cerebras REAP env (Python 3.12 +, CUDA)
+bash scripts/setup_env.sh
+
+# 2) Layer-wise REAP with the agentic 6-dataset mix (Cerebras HF recipe)
+bash scripts/run_layerwise_reap.sh \
+  --model "$(pwd)/models/MiniMax-M2.7-172B-BF16" \
+  --ratio 0.25 \
+  --gpus 0
+```
+
+Override examples:
+
+```bash
+# Full 230B BF16 path + 30% prune (256 → ~179 experts)
+MODEL_PATH=/data/MiniMax-M2.7-BF16 RATIO=0.30 bash scripts/run_layerwise_reap.sh
+
+# Observer only (collect saliency, skip prune/save)
+RUN_OBSERVER_ONLY=1 bash scripts/run_layerwise_reap.sh --model ... --ratio 0.25
+```
+
+Default calibration mix (agentic):
+
+```text
+theblackcat102/evol-codealpaca-v1:4096,
+Salesforce/xlam-function-calling-60k:4096,
+open-r1/Mixture-of-Thoughts[code]:4096,
+open-r1/Mixture-of-Thoughts[math]:4096,
+open-r1/Mixture-of-Thoughts[science]:4096,
+SWE-bench/SWE-smith-trajectories(tool):4096
+```
+
+## MiniMax patches (in `vendor/cerebras-reap`)
+
+Upstream REAP did not register `MiniMaxM2ForCausalLM`. Local changes:
+
+1. `MODEL_ATTRS` + observer registry for `MiniMaxM2SparseMoeBlock`
+2. Sigmoid router scores + `e_score_correction_bias` for top-k (matches MiniMax routing)
+3. Pruner preserves `MiniMaxM2Experts` subclass and slices MoE-level bias
+
+## Disk pressure
+
+This volume is nearly full (~12 GB free). Free space or point `ARTIFACTS_DIR` / pruned output to another disk **before** running — a pruned BF16 write needs hundreds of GB.
+
+## References
+
+- Paper: [REAP the Experts](https://arxiv.org/abs/2510.13999)
+- Upstream: [CerebrasResearch/reap](https://github.com/CerebrasResearch/reap)
+- Layer-wise CLI: `vendor/cerebras-reap/experiments/pruning-layerwise-cli.sh`
+- Prior MiniMax REAP checkpoints: [cerebras/MiniMax-M2-REAP collection](https://huggingface.co/collections/cerebras/cerebras-reap)
+
+
+## Mac streaming REAP (Gemma4 test)
+
+Uses the same Cerebras 6-way mix locally (`calib/cerebras_reap_mix.jsonl`). Rebuild with:
+
+```bash
+.venv/bin/python scripts/build_cerebras_calib_mix.py
+```
+
+(xLAM via ungated mirror `NobodyExistsOnTheInternet/xlam-function-calling-60k`.)
+
+```bash
+bash scripts/reap_gemma4.sh
+# or smoke on 3 layers:
 .venv/bin/python -m reap_stream.cli collect \
-  --model models/Step-3.7-Flash \
-  --dataset-file calib/cloud_reap_8k.jsonl \
-  --output artifacts/step37-1024-headtail \
-  --max-tokens 1024 \
-  --truncation headtail \
-  --layers-at-once 2
+  --model ~/.lmstudio/models/lmstudio-community/gemma-4-26B-A4B-it-QAT-MLX-4bit \
+  --dataset-file calib/cerebras_reap_mix.jsonl \
+  --output artifacts/gemma4-smoke \
+  --ratio 0.25 --layers 0-2 --max-tokens 128
 ```
-
-### 2. Build Fused Pruned + 4-bit Quantized Student
-```bash
-.venv/bin/python -m reap_stream.cli apply \
-  --model models/Step-3.7-Flash \
-  --plan artifacts/step37-1024-headtail/plan_p15.json \
-  --output models/Step-3.7-p15-4bit \
-  --mode affine \
-  --group-size 64
-```
-
----
-
-## Refined Empirical Roadmap
-
-1. **Co-occurrence Correlation Measurement**: Compute $\mathbf{C}_{i,j} = \frac{\sum_{t} (g_i h_i)^T (g_j h_j)}{\sqrt{\sum_t \|g_i h_i\|^2 \sum_t \|g_j h_j\|^2}}$ over top-8 co-occurrences to measure true cross-expert feature redundancy.
-2. **RMSNorm Residual Projection Saliency**: Drop-in replacement metric $S_{\text{RMSNorm}}(e) = \mathbb{E}_t [g_{t,e} \|h_{t,e} - \frac{\langle x_t, h_{t,e}\rangle}{\|x_t\|_2^2} x_t\|]$ to filter out parallel energy rescaled by downstream RMSNorm.
-3. **Trace Normalization**: Layer trace scaling $\frac{S_l(e)}{\operatorname{Tr}(S_l)}$ to resolve the $0.17 \to 24.0$ cross-depth magnitude explosion.
-
----
-
-## References & Citations
-
-- **REAP Paper**: [REAP the Experts: Why Pruning Prevails for One-Shot MoE Compression](https://arxiv.org/abs/2510.13999) (Cerebras Research, ICLR 2026).
-- **Upstream Code**: [CerebrasResearch/reap](https://github.com/CerebrasResearch/reap)

@@ -23,6 +23,17 @@ several "obvious" fixes measured *worse* than what they replaced.
 
 **The vision issue is the largest open problem by a wide margin.**
 
+> **See also `TOKENIZER-INVESTIGATION.md`** — numeric corruption in serving
+> was a **real bug, found and fixed** (2026-07-26): `tokenizer_config.json`
+> declares `tokenizer_class="LlamaTokenizerFast"`, which makes
+> `AutoTokenizer` (what LM Studio actually calls) discard this model's real
+> pretokenizer for Llama's own SentencePiece/Metaspace scheme. Two keys
+> deleted, no weight change; verified 0/12 → 5/5 on both canonical failing
+> cases via live generation. **PPL/NLL numbers below are unaffected** —
+> `eval_ppl_streamed.py` goes through `transformers`, a different code path
+> than the one that broke serving, so every run here used correct
+> tokenisation regardless.
+
 ---
 
 ## 1. The reap decision: 15% (keep 245/288)
@@ -310,6 +321,37 @@ Built student: `models/Step-3.7-p15-4bit` — 92 GB, 245 experts, **4.632 bpw**,
 via `scripts/build_student.py` (fused apply+quantize, never writes the ~316 GB
 reaped-BF16 intermediate). Smoke-tested: loads, generates coherently, 58 tok/s.
 **Coherent with zero recovery**, corroborating the 15% choice.
+
+### 8a. Requantizing from an already-quantized source is strictly lossy
+
+Measured accidentally, then kept — an 8-bit `lm_head`/`embed_tokens` built by
+**dequantizing the student's existing 4-bit head and requantizing to 8-bit**,
+against the same shared8 student with its head left at 4-bit. Identical weights
+elsewhere (18 of 20 shards hardlinked), 500 held-out prompts:
+
+| category | 4-bit head | 8-bit head **from 4-bit source** | ΔNLL |
+|---|---|---|---|
+| agentic | 6.921 | 7.075 | +0.022 |
+| coding | 6.488 | 6.545 | +0.009 |
+| general_instruction | 5.115 | 5.194 | +0.016 |
+| reasoning_math | 2.4848 | 2.4846 | −0.000 |
+| tool_use | 27.18 | 27.81 | +0.023 |
+| **OVERALL** | **5.930** | **6.010** | **+0.013** |
+
+**Doubling the bit-width made every category worse** and cost +0.53 GB.
+Quantization is lossy and one-way: the 4-bit rounding is already baked in, so
+the wider container stores degraded values and the second rounding pass adds
+fresh error on top. `artifacts/ppl-head8-requant-from-4bit-500.json`.
+
+**Rule:** always quantize from the highest-precision source available. This
+applies directly to *converting* a released quantized checkpoint into another
+format — e.g. an existing 4-bit MLX repo re-encoded to nvfp4 — which inherits
+the original's loss and adds its own. A conversion is not a requantization of
+the original model; it is a quantization of an already-damaged one.
+
+The result also functions as a sanity check on any precision experiment: more
+bits cannot make a model better-than-source. A precision increase measuring
+*worse* means the source, not the target, is wrong.
 
 ---
 
