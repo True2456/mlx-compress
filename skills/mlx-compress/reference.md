@@ -85,6 +85,23 @@ by MLP quantization, so compute it once and reuse it — that makes the pass
 
 ---
 
+## REAP adapter surface
+
+Five hooks make the streaming loop architecture-agnostic. Reference
+implementation: `reap_streaming/adapters/mlx_lm_moe.py`.
+
+| hook | contract |
+|---|---|
+| `text_model(model)` | unwrap the VLM/causal-LM shell to the thing with `.layers` |
+| `moe_layer_ids(text)` | which layer indices are MoE (dense layers still run, for hidden-state carry) |
+| `num_experts(text)` | routed experts per MoE layer, assumed uniform |
+| `embed(text, ids)` | initial hidden state, including any architecture-specific scaling |
+| `install_probe(text, i, stats)` | mutate layer *i* in place so it accumulates (expert_ids, gate_weights, activation_norms) without changing its output |
+| `run_layer(layer, h)` | one block forward, handling this architecture's mask/cache conventions; **must `mx.eval()` before returning** |
+| `free_layer(text, i)` | drop the layer's weights |
+
+The same surface drives imatrix collection — only the probe differs.
+
 ## Distributed (two machines)
 
 Only worth it when the backward pass will not fit. Quantized-MoE backward needs

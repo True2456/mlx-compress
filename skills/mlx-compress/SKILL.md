@@ -1,13 +1,14 @@
 ---
 name: mlx-compress
 description: >-
-  Compressing large language models on Apple Silicon: AWQ/DWQ quantization, bit
-  allocation from importance matrices, REAP expert pruning, REAM merging, and
-  streaming collection/evaluation for models larger than unified memory. Use
-  when quantizing an MLX model, choosing bits per tensor family, designing a
-  calibration set, deciding whether a quantized build is good, running anything
-  on a model that does not fit in RAM, or when the user mentions AWQ, DWQ,
-  imatrix, oQ/oQe, REAP, REAM, group_size, BPW, or MTP drafters.
+  Shrinking large language models on Apple Silicon end to end: analyse (importance
+  matrices, saliency), prune (REAP), merge (REAM), quantize (AWQ/DWQ, bit
+  allocation per tensor family), and evaluate — including streaming everything for
+  models larger than unified memory. Use when quantizing or pruning an MLX model,
+  choosing bits or group sizes, designing a calibration set, judging whether a
+  compressed build is actually good, or when the user mentions AWQ, DWQ, imatrix,
+  oQ/oQe, REAP, REAM, expert pruning, group_size, BPW, MTP drafters, or a model
+  that does not fit in RAM.
 ---
 
 # Compressing models on Apple Silicon
@@ -110,6 +111,28 @@ sees at inference; calibrating without them is off-distribution.
 
 ---
 
+## Pruning and merging MoE experts
+
+REAP scores each expert by router-weighted activation norm and drops the lowest.
+Same streaming loop as everything else here: run one block, score it, free it.
+
+- **Cache eviction is the load-bearing part**, not the scoring. `mx.eval()` and
+  `mx.clear_cache()` inside the per-prompt loop are what keep peak memory flat.
+- Adapter surface is five hooks: resolve the text model, list MoE layer indices,
+  get expert count, embed tokens, install a probe, run one layer, free one layer.
+- Checkpoint per layer. These runs are long and Thunderbolt links drop.
+
+**REAM merges instead of deleting** — folding each pruned expert into its most
+similar kept one. Do not reach for it by default. Measured on Step-3.7: PPL
+improved by 0.194 while accuracy stayed flat (24/24 prune vs 23/24 REAM). The
+PPL gain was smoothing, not capability. This is the cleanest demonstration in
+this whole body of work that **perplexity over-credits** — if you evaluate
+REAM on PPL you will ship it, and you will be wrong.
+
+Prune first, then quantize. Pruning changes the activation distribution, so an
+imatrix or AWQ calibration collected before pruning describes a model that no
+longer exists.
+
 ## Traps that produce plausible, wrong models
 
 **`mx.load` returns file-backed arrays.** `mx.save_safetensors` to that same
@@ -183,5 +206,23 @@ evaluation. A 155 GB model can be benchmarked on a 128 GB machine this way.
 
 ---
 
+## Relationship to the other MLX skills
+
+`mlx` and `swift-mlx-lm` are vendored: they cover running, serving and
+fine-tuning, and their advice is API-level. This skill covers what happens when
+you actually compress a frontier model and measure it. Where they disagree,
+this one is measured on 27B–304B models.
+
+One disagreement matters. The `mlx` skill's `reference/quantization.md`
+describes DWQ as using "knowledge distillation to preserve quality", with no
+caveat. Measured on DeepSeek-V4: held-out KL fell 89–91% and MMLU did not move
+(p=0.65), while P(EOS) at agentic turn starts rose 0.0004 → 0.0795. The CLI
+works exactly as documented; what is undocumented is that the objective it
+optimises does not track capability. Treat `mlx_lm.dwq` as unproven, not as a
+quality-preserving default.
+
+Use `mlx` for conversion, serving and LoRA. Use this for deciding what to
+compress, by how much, and whether the result is any good.
+
 See `reference.md` for architecture-specific recipes, kernel constraints,
-distributed setup, and the full negative-result list.
+distributed setup, the REAP adapter surface, and the full negative-result list.
