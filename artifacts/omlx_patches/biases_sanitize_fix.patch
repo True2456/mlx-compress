@@ -1,0 +1,39 @@
+# Local oMLX bundle edits (oMLX 0.5.8.dev3, build 260811023551-macos26-27)
+# Bug: sanitize suffix loop omits "biases" -> AWQ DeepSeek-V4 loads with missing bias
+# tensors. Upstreamed as jundot/omlx#2598 - verify before reapplying.
+
+### deepseek_v4/deepseek_v4_model.py
+--- deepseek_v4/deepseek_v4_model.py.bak	2026-08-11 21:12:47
++++ deepseek_v4/deepseek_v4_model.py	2026-08-11 21:12:54
+@@ -2276,7 +2276,7 @@
+                 ("w2", "down_proj"),
+                 ("w3", "up_proj"),
+             ):
+-                for suffix in ("weight", "scales"):
++                for suffix in ("weight", "scales", "biases"):
+                     key0 = f"{prefix}.0.{src}.{suffix}"
+                     if key0 in weights:
+                         stacked = [
+
+### mlx_lm_mtp/deepseek_v4_model.py
+--- mlx_lm_mtp/deepseek_v4_model.py.bak	2026-08-11 21:49:32
++++ mlx_lm_mtp/deepseek_v4_model.py	2026-08-11 21:49:32
+@@ -830,7 +830,7 @@
+                 ("w2", "down_proj"),
+                 ("w3", "up_proj"),
+             ):
+-                for suffix in ("weight", "scales"):
++                for suffix in ("weight", "scales", "biases"):
+                     key0 = f"{prefix}.0.{src}.{suffix}"
+                     if key0 in weights:
+                         stacked = [
+@@ -883,7 +883,7 @@
+                     ("w2", "down_proj"),
+                     ("w3", "up_proj"),
+                 ):
+-                    for suffix in ("weight", "scales"):
++                    for suffix in ("weight", "scales", "biases"):
+                         key0 = f"{prefix}.0.{src}.{suffix}"
+                         if key0 in weights:
+                             stacked = [
+

@@ -6,6 +6,11 @@
 scripts/hosts.json
 artifacts/**
 !artifacts/.gitkeep
+# keep small, hand-written artifacts: model cards and upstream patches.
+# (the blanket artifacts/** rule above exists for imatrices, logs and weights)
+!artifacts/hf_card_*.md
+!artifacts/omlx_patches/
+!artifacts/omlx_patches/**
 calib/**
 !calib/.gitkeep
 # never commit multi-hundred-GB weights

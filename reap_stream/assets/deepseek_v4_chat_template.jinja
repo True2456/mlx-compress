@@ -1,0 +1,89 @@
+{#-
+  DeepSeek-V4-Flash chat template, with tool-calling support added.
+
+  The upstream template (and mlx_vlm's built-in DEFAULT_CHAT_TEMPLATE) has no
+  `tools` handling at all: tool definitions passed by the client are silently
+  discarded, and `tool`-role messages vanish entirely. The model is then asked
+  to use tools it was never shown, and improvises from training priors --
+  producing Anthropic-style `<function_calls><invoke name=...>` blended with
+  the `string="true"` attribute from its own native DSML training. That happens
+  identically under LM Studio and oMLX, because both render this same file.
+
+  DeepSeek's real format is DSML (`<｜DSML｜invoke name="...">`, see
+  encoding/README.md upstream). We deliberately do NOT use it: nothing
+  downstream parses DSML into structured tool calls. LM Studio's engine only
+  grammar-guards `gemma4` and `qwen3_5`; every other architecture -- Step-3.7
+  included -- gets its tool calls purely by prompt-following in a format the
+  client already recognizes. So we use the same qwen3-coder-style XML that
+  Step-3.7 uses successfully. Off-distribution for this model, but parseable;
+  DSML would be in-distribution and unparseable.
+-#}
+{%- set mode = thinking_mode|default('chat') -%}
+<｜begin▁of▁sentence｜>
+{%- for message in messages -%}
+    {%- if message['role'] == 'system' -%}
+        {{- message['content'] -}}
+    {%- endif -%}
+{%- endfor -%}
+{%- if tools -%}
+    {{- "\n\n# Tools\n\nYou have access to the following functions in JSONSchema format:\n\n<tools>" -}}
+    {%- for tool in tools -%}
+        {{- "\n" -}}
+        {{- tool | tojson(ensure_ascii=False) -}}
+    {%- endfor -%}
+    {{- "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...>\n...\n</function> block must be nested within <tool_call>\n...\n</tool_call> XML tags\n- Required parameters MUST be specified\n- Do NOT use any other tool-call syntax\n</IMPORTANT>\n" -}}
+{%- endif -%}
+{%- for message in messages -%}
+    {%- if message['role'] == 'user' -%}
+        <｜User｜>{{- message['content'] -}}<｜Assistant｜>
+        {#- Only open/close the reasoning block here when generation follows
+            directly. If an assistant message comes next, it emits its own
+            marker -- the upstream template emitted both, producing a
+            malformed `</think></think>` on every multi-turn prompt. -#}
+        {%- if loop.last -%}
+            {%- if mode == 'thinking' -%}<think>{%- else -%}</think>{%- endif -%}
+        {%- endif -%}
+    {%- elif message['role'] == 'tool' -%}
+        {#- Tool results ride inside a user turn, matching DeepSeek's own
+            convention of returning results to the model as user content.
+            Consecutive tool messages are merged into one turn. -#}
+        {%- if loop.first or messages[loop.index0 - 1]['role'] != 'tool' -%}
+            <｜User｜>
+        {%- endif -%}
+        <tool_result>{{- message['content'] -}}</tool_result>
+        {%- if loop.last or messages[loop.index0 + 1]['role'] != 'tool' -%}
+            <｜Assistant｜>
+            {%- if loop.last -%}
+                {%- if mode == 'thinking' -%}<think>{%- else -%}</think>{%- endif -%}
+            {%- endif -%}
+        {%- endif -%}
+    {%- elif message['role'] == 'assistant' -%}
+        {%- if mode == 'thinking' and message.get('reasoning_content') -%}
+            {{- message['reasoning_content'] -}}</think>
+        {%- else -%}
+            </think>
+        {%- endif -%}
+        {{- message['content'] -}}
+        {%- if message.tool_calls -%}
+            {%- for tool_call in message.tool_calls -%}
+                {%- if tool_call.function is defined -%}
+                    {%- set tool_call = tool_call.function -%}
+                {%- endif -%}
+                {{- '<tool_call>\n<function=' + tool_call.name + '>\n' -}}
+                {%- if tool_call.arguments is defined -%}
+                    {%- set arguments = tool_call.arguments | fromjson if tool_call.arguments is string else tool_call.arguments -%}
+                    {%- for name, value in arguments.items() -%}
+                        {{- '<parameter=' + name + '>\n' -}}
+                        {{- value if value is string else value | tojson -}}
+                        {{- '\n</parameter>\n' -}}
+                    {%- endfor -%}
+                {%- endif -%}
+                {{- '</function>\n</tool_call>' -}}
+            {%- endfor -%}
+        {%- endif -%}
+        <｜end▁of▁sentence｜>
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt and messages[-1]['role'] not in ['user', 'tool'] -%}
+    <｜Assistant｜></think>
+{%- endif -%}

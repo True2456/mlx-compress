@@ -127,8 +127,10 @@ def main():
         model.no_chunked_prefill = False
 
     logger.info(f"{Colors.HEADER}Loading local preference data from {cfg['data']}{Colors.ENDC}")
-    train_ds = load_dataset("json", data_files=f"{cfg['data']}/orpo_stopping_train.jsonl", split="train")
-    valid_ds = load_dataset("json", data_files=f"{cfg['data']}/orpo_stopping_valid.jsonl", split="train")
+    train_file = cfg.get("train_file", "orpo_stopping_train.jsonl")
+    valid_file = cfg.get("valid_file", "orpo_stopping_valid.jsonl")
+    train_ds = load_dataset("json", data_files=f"{cfg['data']}/{train_file}", split="train")
+    valid_ds = load_dataset("json", data_files=f"{cfg['data']}/{valid_file}", split="train")
     logger.info(f"train: {len(train_ds)} pairs, valid: {len(valid_ds)} pairs")
 
     train_dataset = PreferenceVisionDataset(train_ds, config, processor)

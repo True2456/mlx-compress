@@ -106,3 +106,29 @@ bash scripts/reap_gemma4.sh
   --output artifacts/gemma4-smoke \
   --ratio 0.25 --layers 0-2 --max-tokens 128
 ```
+
+## Mac streaming REAP (Laguna-S-2.1)
+
+`poolside/Laguna-S-2.1-NVFP4-mlx` (local LM Studio download, not on the
+public Hub under this project's radar until now) — already native NVFP4
+4-bit, 256 experts/layer, 47 MoE layers. Dedicated collect/apply pair
+(ported from `collect_deepseek_v4.py`/`apply_deepseek_v4.py`, simpler:
+no hyper-connections, no hash-routed layers — see
+`docs/LAGUNA-REAP-FINDINGS.md` for the full writeup).
+
+```bash
+.venv/bin/python -m reap_stream.collect_laguna \
+  --model ~/.lmstudio/models/poolside/Laguna-S-2.1-NVFP4-mlx \
+  --output artifacts/laguna-reap \
+  --dataset-file calib/cerebras_reap_mix.jsonl \
+  --max-samples 2500 --max-tokens 1024 --ratio 0.375
+
+.venv/bin/python -m reap_stream.apply_laguna \
+  --model ~/.lmstudio/models/poolside/Laguna-S-2.1-NVFP4-mlx \
+  --plan artifacts/laguna-reap/pruning-plan.json \
+  --output models/Laguna-S-2.1-REAP
+```
+
+Measured result: 67GB → 45GB (256→160 experts, 37.5% prune), targeting a
+64GB deploy machine. Not yet accuracy-tested beyond a load+generate smoke
+check — see `docs/LAGUNA-REAP-FINDINGS.md` §7.
