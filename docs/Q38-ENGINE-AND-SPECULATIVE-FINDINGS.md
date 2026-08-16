@@ -347,6 +347,51 @@ still drops a fact sometimes; at 0.70 the drafter cost eats the whole gain. The
 ppTPS column flatters itself because it counts only the tokens actually
 prefilled.
 
+### Drafter choice: Qwen3.5-2B at keep 0.40
+
+Both Qwen3.5-family drafters share the target's vocabulary exactly, so both are
+viable. Measured at 16K, five facts, three repeats, `--max-tokens 256`:
+
+| drafter | keep | TTFT | facts (3 runs) | missed |
+|---|---|---|---|---|
+| 0.8B | 0.30 | 13.2 s | 4, 4, 4 | Osprey |
+| 0.8B | 0.40 | 16.5 s | 4, 4, 4 | Osprey |
+| 0.8B | 0.50 | 20.4 s | 4, **5**, **5** | Osprey once |
+| 2B | 0.30 | 13.5 s | 4, 4, 4 | Kestrel |
+| **2B** | **0.40** | **17.7 s** | **5, 5, 5** | — |
+| 2B | 0.50 | 22.3 s | 5, 5, 5 | — |
+
+**The 2B is the only clean floor in the table.** The 0.8B never reaches a
+reliable 5/5 — even at keep 0.50 it drops a fact one run in three. So the 2B is
+both faster (17.7 s vs 20.4 s) and more reliable than the 0.8B's best setting.
+
+**Scoring cost is far smaller than assumed.** Measured over a 16K pass, bf16,
+warm, min of 3: 0.8B **0.97 s**, 2B **1.53 s**. The 2B therefore costs +0.56 s
+and buys 10 points of `keep_pct`. An earlier estimate that it "needed 15 points
+to break even" came from guessing the scoring pass at 3 s and 8 s; the real bar
+is ~1.6 points.
+
+**Do not quantize the scorer.** 8-bit bought nothing on the 0.8B (0.98 s vs
+0.97 s) and cost 8% on the 2B (1.66 s vs 1.53 s). Prefill is compute-bound, so
+there is no weight bandwidth to reclaim and dequant is added work. bf16 also
+keeps quantization error away from a component that is **not**
+rejection-verified: unlike an MTP or DFlash draft, a bad token selection is
+never checked by the target, so there is no acceptance rate to absorb it — the
+damage is silent context loss.
+
+Each drafter has a *characteristic* blind spot — the 0.8B loses Osprey
+(depth 0.3) every run, the 2B loses Kestrel (depth 0.1) every run. Same fact,
+every repeat: these are deterministic rankings with systematic weaknesses, not
+scatter, which is itself evidence the scores are meaningful.
+
+**Harness trap: the sampling budget must fit a preamble.** At `--max-tokens 64`
+the 2B scored 5/5, 0/5, 0/5 at keep 0.30, which looked like catastrophic
+instability. It was truncation: with `enable_thinking=False` the model still
+sometimes narrates ("Let me search through the conversation history...") before
+answering, and 64 tokens expired mid-narration on a selection that had kept the
+facts. Default is now 256. This is the second time in this document that a
+generation-budget artifact was nearly read as a model result.
+
 ### Tokenizer compatibility
 
 | drafter | vocab | id-match vs Qwen3.8 |
