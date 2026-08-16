@@ -109,15 +109,29 @@ models promoted in place, raw shards preserved at
 
 ## 3. The speculative landscape for this model
 
-oMLX exposes **four separate, mutually exclusive** options. They are not one
-feature, and MTP is not "speculative decoding with a draft model".
+oMLX exposes **four separate** options. They are not one feature, and MTP is not
+"speculative decoding with a draft model".
 
 | option | what drafts | draft checkpoint | phase |
 |---|---|---|---|
-| `mtp_enabled` | the checkpoint's own MTP heads | none — embedded | decode |
+| `mtp_enabled` ("Lightning MTP") | the checkpoint's own MTP heads | none — embedded | decode |
 | `dflash_enabled` | DFlash block-diffusion draft | DFlash-format | decode |
 | `vlm_mtp_enabled` | external assistant drafter | `gemma4_assistant` or `qwen3_5_mtp` | decode |
 | `specprefill_enabled` | small LM scores token importance | any small LM | **prefill** |
+
+**They are not all mutually exclusive**, and the exception matters. From
+`model_settings.__post_init__`:
+
+- `mtp_enabled` + `dflash_enabled` → rejected (both claim the decode slot)
+- `vlm_mtp_enabled` + any other speculative path or TurboQuant → rejected
+- **`mtp_enabled` + `specprefill_enabled` → allowed**, and is the production
+  config: MTP drives tgTPS, the small draft model drives the ppTPS step above
+  8192 tokens.
+
+So DFlash and DSpark are only ever *replacements* for MTP — their best case is
+beating 45 tok/s, and both lost. SpecPrefill is **additive**, stacking on top of
+MTP. That makes the SpecPrefill integration the more valuable remaining work for
+q38 by some margin.
 
 ### Measured: MTP vs DFlash
 
@@ -157,10 +171,69 @@ support, and oMLX's `DSparkMarkovHead`/`DSparkConfidenceHead` are registered on
 `mlx_lm.deepseek_v4` only.
 
 **Distillation is not needed.** RadixArk already distilled against Qwen3.8; the
-work is a port, not a training run. Cheapest path first: load DSpark's backbone
-into mlx_vlm's `DFlashDraftModel` by filtering `markov_*` and the confidence
-head — a weight filter, the same trick as the MTP split. Then quantize, then A/B.
-Port the Markov head only if the backbone alone beats MTP.
+work is a port, not a training run.
+
+### Measured: the Markov head is load-bearing, not auxiliary
+
+DSpark's tensors are a strict superset of a working DFlash checkpoint — 14
+shared families, nothing missing, exactly four extra
+(`confidence_head.proj.{weight,bias}`, `markov_head.markov_w{1,2}.weight`). So
+`q38_load_dspark.py` filters those four and the backbone loads into
+`DFlashDraftModel` with no new modelling code. It loads, it runs, and output is
+correct.
+
+It is also useless:
+
+| config | mean tok/s | acceptance |
+|---|---|---|
+| MTP (repaired) | **45.2** | 3.05 tok/forward |
+| DFlash (Qwen3.5-targeted), quantized | 38.7 | — |
+| DSpark backbone minus Markov head | 23.4 | **1.18 tok/round** |
+
+1.18 is barely above 1.0, i.e. essentially no speculation, against DSpark's
+claimed 3.39. **The Markov head supplies most of the acceptance**, and calling it
+optional because it is "just a logit bias" was wrong.
+
+The general lesson: a tensor-name superset proves the weights will *load*. It
+says nothing about whether the model will *work*. Check `_run_speculative`'s
+`[DFLASH] accept=` line before trusting any drafter.
+
+Two things ruled out along the way, so they are not re-investigated:
+`target_layer_ids [4,16,28,40,52]` are DSpark's own and are picked up correctly;
+and `projector_type: "dspark"` is handled identically to `None` in the reference
+`dflash.py` (only `"domino"` differs), so mlx_vlm ignoring that field is
+harmless.
+
+### Markov head ported — helps, does not close the gap
+
+`q38_dspark.py` adds the head to `DFlashDraftModel` (config carry-through,
+`markov_w1`/`markov_w2`, bias added between logits and sampler, aux tensors
+filtered). The whole checkpoint then loads unmodified.
+
+| config | mean tok/s | acceptance |
+|---|---|---|
+| MTP (repaired) | **45.2** | 3.05 tok/forward |
+| DFlash (Qwen3.5-targeted), quantized | 38.7 | — |
+| DSpark backbone only | 23.4 | 1.18 |
+| DSpark + Markov head | 23.7 | **1.33** |
+
+Acceptance rose 1.18 → 1.33, so the head is bound and the bias alignment is at
+least directionally right (a misaligned bias would have lowered it). But the
+head's cost cancels the gain, and 1.33 is still nowhere near the claimed 3.39.
+
+**The remaining gap looks architectural.** mlx_vlm's `draft_block` is
+**single-shot**: one forward from `[last_token, MASK, MASK, ...]`, logits for
+all positions in parallel. A *bigram* bias conditioned on a MASK token is nearly
+meaningless for every position after the first — which is the shape of the
+result. Block diffusion as DSpark uses it iterates: draft, refill the block with
+the drafted tokens, re-run, so the bias conditions on real tokens. Supporting
+that is a much deeper change than adding two tensors, and it would also be where
+the confidence head (which sizes blocks per step) starts to matter.
+
+**Recommendation: stop here.** MTP at 45.2 tok/s is well ahead of every drafter
+tried, is embedded in the checkpoint, and costs 0.28 GB. The DSpark path needs
+iterative block refinement in mlx_vlm before its 3.39 is reachable, and that is
+a substantially larger project than the remaining items below.
 
 (Distillation *would* work here, unlike DWQ: the objective is draft-target
 agreement, which is literally what acceptance measures, not a proxy for it.)
@@ -263,14 +336,19 @@ download**, not a corrupt model. Cost a confusing `FileNotFoundError`.
 
 ## 6. Open work, by value
 
-1. **Load DSpark's backbone as plain DFlash** (filter `markov_*` + confidence
-   head), quantize, A/B against MTP's 39.4. Matched target, no new modelling
-   code if tensor names line up.
+1. **Wire SpecPrefill into the server** via the `position_ids` approach, default
+   keep 0.5 with a tokenizer-matched drafter. This is the top item because it
+   **stacks with MTP** rather than replacing it — it is the difference between
+   q38 matching the production oMLX setup and having only half of it.
 2. **`mtp_num_draft_tokens > 3`.** Never tested; acceptance at depth 3 was 96%,
-   so there may be free speed. Config change, no rebuild.
-3. **Wire SpecPrefill into the server** via the `position_ids` approach, default
-   keep 0.5 with a tokenizer-matched drafter.
-4. **Port the DSpark Markov head** if #1 beats MTP.
-5. **Harder SpecPrefill eval** at other context lengths and on non-retrieval
+   so there may be free speed. Config change, no rebuild, and it improves the
+   path that already wins.
+3. **MTP vs DFlash across context lengths.** Every drafter comparison here used
+   a 66-token prompt. The MTP head is one layer over the full KV; DFlash is 6
+   layers each holding their own cache, so its per-round cost should grow faster
+   — but that is a prediction, not a measurement.
+4. **Harder SpecPrefill eval** at other context lengths and on non-retrieval
    work (summarisation may tolerate dropped spans far better than fact lookup).
-6. Commit the engine and tools to git — nothing here is version-controlled yet.
+5. **DSpark iterative block refinement**, if ever. Needs multi-step diffusion in
+   mlx_vlm's `draft_block`; the Markov head alone got 1.18 → 1.33 against a
+   claimed 3.39. Large project, and it only ever replaces MTP.
