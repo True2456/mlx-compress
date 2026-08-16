@@ -127,13 +127,44 @@ oMLX exposes **four separate** options. They are not one feature, and MTP is not
 - **`mtp_enabled` + `specprefill_enabled` → allowed**, and is the production
   config: MTP drives tgTPS, the small draft model drives the ppTPS step above
   8192 tokens.
-- **`dflash_enabled` + `specprefill_enabled` → also allowed.** The only pairwise
-  rejection in `__post_init__` is mtp+dflash; everything else is the vlm_mtp
-  list. So a DFlash drafter stacks with SpecPrefill exactly as MTP does.
+- `dflash_enabled` + `specprefill_enabled` → **passes validation and then
+  silently does nothing.** See below. Config-level permission is not
+  implementation.
 
-So the decode slot is a straight choice between MTP and DFlash — and which wins
-depends on context length (see above: MTP below ~4K, DFlash from ~8K). Whichever
-takes that slot, SpecPrefill is **additive** on the prefill side.
+### DFlash forfeits SpecPrefill — which decides the production config
+
+`omlx/engine/dflash.py` contains **zero references to specprefill**. The feature
+is wired only into `engine/batched.py` and `engine/vlm.py`, both of which call
+`scheduler.set_specprefill_draft_model(...)`. DFlash runs through its own engine
+class, so enabling both leaves prefill dense — visible as flat ppTPS (634–684
+across every context) against 2496 on the MTP+SpecPrefill sweeps.
+
+At 16K this dominates everything else:
+
+| | TTFT | tgTPS | **E2E** | throughput |
+|---|---|---|---|---|
+| MTP + SpecPrefill | 6.6 s | 49.6 | **9.2 s** | 1802.7 |
+| DFlash-q (SpecPrefill inert) | 24.4 s | 74.0 | **26.2 s** | 631.0 |
+
+DFlash wins decode by 49% and loses end-to-end by **2.8x**. For 128 output
+tokens the decode advantage is worth ~0.9 s while the prefill penalty costs
+~17.8 s. Prefill dominates at these lengths, so the decode win is the smaller
+term.
+
+**MTP + SpecPrefill is therefore the production config**, not because its decode
+is better — it is not, above 8K — but because DFlash currently forces you to
+give up the larger win.
+
+This reframes the DFlash result as an **upstream feature gap**: wiring
+SpecPrefill scoring into `DFlashEngine` the way `batched.py` and `vlm.py` do it
+would plausibly give 74 tgTPS *and* 6.6 s TTFT. That is a well-defined oMLX
+contribution.
+
+A methodological note, since this was got wrong twice in one session: reading a
+config validator and inferring behaviour is not verification. `__post_init__`
+not rejecting a combination says nothing about whether any engine implements it,
+exactly as a matching tensor-name set said nothing about whether DSpark's
+backbone would draft usefully. Check the execution path.
 
 ### Measured: MTP vs DFlash
 
@@ -167,9 +198,15 @@ Full sweeps, `Qwen3.5-27B-DFlash-q` (the quantized 0.78 GB build):
 | 16k | **14.4** | 20.3 | **70.1** | 49.6 |
 | 32k | 20.4 | 21.2 | 49.4 | 47.5 |
 
-DFlash gets *faster* with context to 16K while MTP degrades: +41% tgTPS at 16K,
-far outside the ±7 tok/s single-sweep noise band established elsewhere in this
-document.
+DFlash gets *faster* with context to 16K while MTP degrades: +41% tgTPS at 16K.
+
+**Caveat — single-sweep rows are unreliable here.** A second sweep of the same
+config gave 48.8 / 36.0 / 51.9 / 74.0 / 81.5 / 38.0 (1k…64k). Against run 1 that
+is −31% at 4K and **+65% at 32K**: the 32K row that looked like a trend break in
+run 1 became the fastest row in run 2. Only the 16K result (70.1, 74.0) and the
+general middle-context shape survive both runs. Fixed-context repeats, three per
+config, are the protocol that resolved this elsewhere in this document; the
+edges (4K, 32K, 64K) remain unresolved without them.
 
 **Mechanism.** As context grows the 27B target's forward dominates, so what
 matters is tokens accepted per target forward. DFlash drafts a block of **16**;
