@@ -379,10 +379,28 @@ rejection-verified: unlike an MTP or DFlash draft, a bad token selection is
 never checked by the target, so there is no acceptance rate to absorb it — the
 damage is silent context loss.
 
-Each drafter has a *characteristic* blind spot — the 0.8B loses Osprey
-(depth 0.3) every run, the 2B loses Kestrel (depth 0.1) every run. Same fact,
-every repeat: these are deterministic rankings with systematic weaknesses, not
-scatter, which is itself evidence the scores are meaningful.
+**Three repeats is not enough here; use five.** The lookahead is stochastic, so
+this metric has high run-to-run variance and a three-run 5/5 is routinely luck.
+Two claims in this document were built on three-run results and did not survive
+five:
+
+- *"Each drafter has a characteristic blind spot"* — the 0.8B appeared to lose
+  Osprey every run and the 2B to lose Kestrel every run, which looked like a
+  systematic bias against early tokens. With five repeats the missed fact moves
+  around (Kestrel at keep 0.20/0.25, Osprey at 0.30). It is scatter, not a
+  fixed positional weakness.
+- *"Stratified selection lowers the floor to keep 0.30"* — measured 5,5,5 over
+  three runs, then **4,5,5,4,4** over five. It does not.
+
+**Stratified selection: implemented, no benefit.** `select_chunks` gained
+`stratify_bins` / `stratify_frac` (reserve part of the budget for even coverage
+across N regions, allocate the rest by global rank; `stratify_bins=0` reproduces
+upstream exactly). At keep 0.40 it is clean either way — 17.3 s stratified
+against 17.7 s plain, inside noise — and at lower keep it does not rescue
+anything. It also actively *hurts* the weaker 0.8B scorer (3/5 at keep 0.30
+against 4/5 plain), which is the expected shape: forcing budget into every
+region robs the globally-important chunks, and that only pays if the ranking is
+good but skewed. Keep it off.
 
 **Harness trap: the sampling budget must fit a preamble.** At `--max-tokens 64`
 the 2B scored 5/5, 0/5, 0/5 at keep 0.30, which looked like catastrophic
