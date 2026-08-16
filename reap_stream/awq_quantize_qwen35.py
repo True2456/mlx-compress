@@ -169,7 +169,9 @@ def _verify_forward(layer, x, mask, position_ids, position_embeddings) -> float:
 
 
 def _load_prompts(path: str, n: int, tok, max_tokens: int):
-    toks = []
+    """-> [(token_ids, image_path|None)]. Rows keep their image so the vision
+    tower runs during calibration; text-only rows carry None."""
+    out = []
     for line in open(path):
         if not line.strip():
             continue
@@ -179,10 +181,72 @@ def _load_prompts(path: str, n: int, tok, max_tokens: int):
             continue
         ids = tok.encode(t)[:max_tokens]
         if len(ids) > 8:
-            toks.append(ids)
-        if len(toks) >= n:
+            out.append((ids, rec.get("image_path")))
+        if len(out) >= n:
             break
-    return toks
+    return out
+
+
+def _embed_batch(model, processor, lm, text_mod, rows, texts, PL, pad_id):
+    """Per-prompt embeddings, running images through the processor when present.
+
+    Done one prompt at a time because image token counts differ per row, so a
+    single batched prepare_inputs would need uniform grids. Each row is padded
+    to PL afterwards, which is what the rest of the pass already assumes.
+    """
+    from mlx_vlm.utils import prepare_inputs
+    from PIL import Image
+
+    embeds, id_rows, pos_rows, n_img = [], [], [], 0
+    for (ids, img_path), raw in zip(rows, texts):
+        if img_path:
+            try:
+                inputs = prepare_inputs(processor, images=[Image.open(img_path)],
+                                        prompts=[raw], return_tensors="mlx")
+                # Embed at FULL length first. Truncating input_ids before this
+                # cuts image placeholder tokens and desynchronises them from
+                # pixel_values, which fails inside the merge.
+                iid = inputs["input_ids"]
+                kw = {k: v for k, v in inputs.items()
+                      if k in ("pixel_values", "image_grid_thw")}
+                h = model.get_input_embeddings(iid, **kw)
+                # returns InputEmbeddingsFeatures, not a bare array
+                h = getattr(h, "inputs_embeds", h)
+                if isinstance(h, tuple):
+                    h = h[0]
+                pid, _ = lm.get_rope_index(input_ids=iid,
+                                           image_grid_thw=kw.get("image_grid_thw"))
+                n_img += 1
+            except Exception as e:
+                print(f"[awq-q35] image row failed ({type(e).__name__}), "
+                      f"falling back to text: {img_path}", flush=True)
+                iid = mx.array(ids)[None]
+                h = text_mod.embed_tokens(iid)
+                pid, _ = lm.get_rope_index(input_ids=iid)
+        else:
+            iid = mx.array(ids)[None]
+            h = text_mod.embed_tokens(iid)
+            pid, _ = lm.get_rope_index(input_ids=iid)
+
+        # mrope returns (3, batch, seq) for image rows and (batch, seq) for
+        # text-only ones; normalise so the batch can be concatenated.
+        if pid.ndim == 2:
+            pid = mx.broadcast_to(pid[None], (3, *pid.shape))
+        L = h.shape[1]
+        if L < PL:
+            pad = mx.zeros((1, PL - L, h.shape[-1]), dtype=h.dtype)
+            h = mx.concatenate([h, pad], axis=1)
+            iid = mx.concatenate(
+                [iid, mx.full((1, PL - L), pad_id, dtype=iid.dtype)], axis=1)
+            last = pid[..., -1:] if pid.ndim == 3 else pid[:, -1:]
+            rep = mx.broadcast_to(last, (*pid.shape[:-1], PL - L))
+            pid = mx.concatenate([pid, rep], axis=-1)
+        else:
+            h, iid = h[:, :PL], iid[:, :PL]
+            pid = pid[..., :PL] if pid.ndim == 3 else pid[:, :PL]
+        mx.eval(h, iid, pid)
+        embeds.append(h); id_rows.append(iid); pos_rows.append(pid)
+    return embeds, id_rows, pos_rows, n_img
 
 
 # ------------------------------------------------------------------ main ----
@@ -205,17 +269,26 @@ def quantize(model_path: str, dataset: str, out_dir: str, n_prompts: int,
     batches = _load_prompts(dataset, n_prompts, tok, max_tokens)
     pad_id = getattr(tok, "pad_token_id", None) or getattr(tok, "eos_token_id", 0) or 0
     PL = max_tokens
-    real = sum(len(b) for b in batches)
+    real = sum(len(b[0]) for b in batches)
     print(f"[awq-q35] {len(batches)} prompts, seq={PL}, "
           f"{real}/{len(batches)*PL} real tokens "
           f"({100*(1-real/(len(batches)*PL)):.1f}% padding)", flush=True)
 
-    ids = mx.array([list(b) + [pad_id] * (PL - len(b)) for b in batches])
-    hidden = text.embed_tokens(ids)
-    mx.eval(hidden)
+    raw_texts = []
+    for line in open(dataset):
+        if line.strip():
+            raw_texts.append(json.loads(line).get("text", ""))
+        if len(raw_texts) >= len(batches):
+            break
+    embeds, id_rows, pos_rows, n_img = _embed_batch(
+        model, processor, lm, text, batches, raw_texts, PL, pad_id)
+    hidden = mx.concatenate(embeds, axis=0)
+    ids = mx.concatenate(id_rows, axis=0)
+    position_ids = mx.concatenate(pos_rows, axis=-2) if pos_rows[0].ndim == 3 \
+        else mx.concatenate(pos_rows, axis=0)
+    mx.eval(hidden, ids, position_ids)
+    print(f"[awq-q35] embedded {len(batches)} prompts ({n_img} with images)", flush=True)
     fa_mask, ssm_mask = _masks(text, hidden)
-    position_ids, _ = lm.get_rope_index(input_ids=ids)
-    mx.eval(position_ids)
     position_embeddings = _rope(text, hidden, position_ids)
     if position_embeddings is not None:
         mx.eval(position_embeddings)
@@ -405,14 +478,21 @@ def main():
     ap.add_argument("--n-prompts", type=int, default=256)
     ap.add_argument("--max-tokens", type=int, default=1024)
     ap.add_argument("--n-grid", type=int, default=20)
+    ap.add_argument("--mlp-group-size", type=int, default=None,
+                    help="override MLP group size (64 matches oMLX's NAX tile, "
+                         "which the gs128 native prefill kernel cannot use)")
     ap.add_argument("--ckpt-dir", default=None)
     ap.add_argument("--awq-layers", type=int, default=None,
                     help="AWQ only the first N layers (smoke testing)")
     ap.add_argument("--no-verify", dest="verify", action="store_false",
                     help="skip the bit-exact forward-replication assertion")
     a = ap.parse_args()
+    recipe = dict(DEFAULT_RECIPE)
+    if a.mlp_group_size:
+        for k in ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"):
+            recipe[k] = (recipe[k][0], a.mlp_group_size)
     quantize(a.model, a.dataset, a.out, a.n_prompts, a.max_tokens, a.n_grid,
-             DEFAULT_RECIPE, a.ckpt_dir or (a.out + "-ckpt"), a.verify,
+             recipe, a.ckpt_dir or (a.out + "-ckpt"), a.verify,
              a.awq_layers)
 
 

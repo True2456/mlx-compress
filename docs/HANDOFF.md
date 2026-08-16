@@ -1,6 +1,14 @@
-# Handoff — state as of 2026-08-15
+# Handoff — state as of 2026-08-16
 
 Where everything is, what is done, what is open. Start here.
+
+> **2026-08-16.** Both published Qwen3.8 checkpoints shipped a **raw-HF MTP head
+> on an MLX backbone**, which made MTP a net loss (22.4 tok/s against 24.6 with
+> it off). Fixed with `reap_stream/fix_mtp_norms_qwen35.py`, re-uploaded to both
+> HF repos, and promoted into the local models — decode is now 43.7–47.3 tok/s.
+> A standalone engine, `q38`, was built around it. Full write-up in
+> `docs/Q38-ENGINE-AND-SPECULATIVE-FINDINGS.md`; read that before touching MTP,
+> DFlash, DSpark or SpecPrefill.
 
 ---
 
@@ -33,6 +41,7 @@ resolved.
 
 | doc | covers |
 |---|---|
+| `docs/Q38-ENGINE-AND-SPECULATIVE-FINDINGS.md` | the `q38` engine, the MTP norm defect and its fix, MTP vs DFlash vs DSpark vs SpecPrefill with measurements, measurement traps |
 | `docs/QWEN38-FINDINGS.md` | Qwen3.8-27B: imatrix, recipe, MTP, oMLX kernel bug, compression ladder |
 | `docs/DWQ-DISTRIBUTED-FINDINGS.md` | DeepSeek-V4: §1–12 distributed DWQ, §13 approach comparison, §14 bit allocation, §15 streamed imatrix, §16 padding-mask negative result, §17 AWQ stage ablation |
 | `docs/DEEPSEEK-V4-FINDINGS.md`, `DEEPSEEK-V4-AWQ-MODEL-CARD.md` | DeepSeek build detail |
@@ -97,6 +106,13 @@ produced models that loaded and generated fluent text. Assert bit-exactness
 where you can (`awq_quantize_qwen35.py --verify-forward`).
 
 ---
+
+**Never benchmark with another engine resident.** This cost three separate wrong
+conclusions on 2026-08-16. `omlx-server` at 89% CPU made MTP read 12.0 tok/s
+instead of 39.4 and produced a confident, entirely false verdict on DFlash.
+Resident-but-idle (~1% CPU) is fine; actively working is not. Check
+`ps aux | grep omlx-server` before believing any number, and stop `q38` before
+benchmarking oMLX.
 
 ## Open work, roughly by value
 

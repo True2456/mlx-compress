@@ -76,11 +76,28 @@ Against the bf16 original: **3.9× generation** (55–65 vs 14 tok/s), prefill a
 parity, and a third of the memory. At 64k context this build uses 32.6 GB where
 bf16 needs 68.5 GB.
 
-## MTP (speculative decoding)
+## MTP
 
 Native `mtp_enabled` works and is worth turning on: **1.8–2.1× generation**,
 88.7% draft acceptance, 3.05 tokens per backbone forward, with the drafter
-costing about 1% of backbone time.
+costing about 1% of backbone time. (MTP is a distinct option from speculative
+decoding with an external draft model — they accelerate different phases.)
+
+> **Fixed 2026-08-16 — re-download if you pulled this before that date.**
+> The head shipped in raw-HF norm convention while the backbone was already
+> converted to MLX's, so `mtp.layers.0.input_layernorm` averaged 0.0361 instead
+> of ~1.036 and two norms were negative. Drafts stopped matching the target and
+> acceptance collapsed. On a loader with no compensation this made MTP *slower*
+> than no speculation at all (22.4 vs 24.6 tok/s); repaired, the same setup runs
+> 43.7 tok/s. Inside oMLX the damage was partly masked — its `norm_repair`
+> shifts any head norm averaging below 0.5, which caught 3 of the 7 and left
+> `q_norm` (0.78), `k_norm` (0.79) and `mtp.norm` (1.25) raw; repairing those
+> three measured **+9% decode** (median 53.3 vs 48.8 tok/s, `pp 4096 / tg 128`,
+> three runs each, no overlap between the groups).
+>
+> Only `model-00005-of-00005.safetensors` changed. Benchmarks in this card are
+> unaffected: they were run with MTP off, and MTP is rejection-verified, so a
+> degraded head costs acceptance rate but never output correctness.
 
 The MTP head is quantized (8-bit attention, 6-bit `fc`, 4-bit MLP). This is
 safe: drafts are verified by the target model through rejection sampling, so
