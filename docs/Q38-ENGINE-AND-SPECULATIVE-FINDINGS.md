@@ -127,11 +127,13 @@ oMLX exposes **four separate** options. They are not one feature, and MTP is not
 - **`mtp_enabled` + `specprefill_enabled` → allowed**, and is the production
   config: MTP drives tgTPS, the small draft model drives the ppTPS step above
   8192 tokens.
+- **`dflash_enabled` + `specprefill_enabled` → also allowed.** The only pairwise
+  rejection in `__post_init__` is mtp+dflash; everything else is the vlm_mtp
+  list. So a DFlash drafter stacks with SpecPrefill exactly as MTP does.
 
-So DFlash and DSpark are only ever *replacements* for MTP — their best case is
-beating 45 tok/s, and both lost. SpecPrefill is **additive**, stacking on top of
-MTP. That makes the SpecPrefill integration the more valuable remaining work for
-q38 by some margin.
+So the decode slot is a straight choice between MTP and DFlash — and which wins
+depends on context length (see above: MTP below ~4K, DFlash from ~8K). Whichever
+takes that slot, SpecPrefill is **additive** on the prefill side.
 
 ### Measured: MTP vs DFlash
 
@@ -150,11 +152,47 @@ Qwen3.**5**-27B, not our 3.8.
 second independent confirmation, after the MTP head, that a bf16 drafter inside
 a quantized model pays badly here. `q38_quantize_drafter.py` does it.
 
-DFlash reaches parity, not victory, so MTP stays default: embedded, 4.6x
-smaller, one fewer moving part, tighter variance.
+At a 66-token prompt DFlash reaches parity, not victory. **That result does not
+generalise, and the short prompt was the whole problem.**
 
-**The headroom this reveals:** a drafter distilled for the *wrong* model already
-ties MTP once quantized, so the Qwen3.5-vs-3.8 mismatch is likely the ceiling.
+### DFlash beats MTP from ~8K up (measured in oMLX)
+
+Full sweeps, `Qwen3.5-27B-DFlash-q` (the quantized 0.78 GB build):
+
+| ctx | TPOT DFlash | TPOT MTP | tgTPS DFlash | tgTPS MTP |
+|---|---|---|---|---|
+| 1k | 23.0 ms | 23.5 ms | 43.7 | 42.8 |
+| 4k | 19.2 | 17.8 | 52.4 | **56.5** |
+| 8k | 16.5 | 18.6 | **61.0** | 54.3 |
+| 16k | **14.4** | 20.3 | **70.1** | 49.6 |
+| 32k | 20.4 | 21.2 | 49.4 | 47.5 |
+
+DFlash gets *faster* with context to 16K while MTP degrades: +41% tgTPS at 16K,
+far outside the ±7 tok/s single-sweep noise band established elsewhere in this
+document.
+
+**Mechanism.** As context grows the 27B target's forward dominates, so what
+matters is tokens accepted per target forward. DFlash drafts a block of **16**;
+MTP drafts **3**. DFlash's six extra layers are cheap next to a 27B forward over
+16K tokens, so the amortisation wins. Below ~4K the target forward is cheap and
+that overhead is not yet repaid — which is exactly the 66-token result (38.7 vs
+45.2) rather than a contradiction of it.
+
+**The comparison is confounded in DFlash's favour to a degree, and against it in
+another.** The MTP sweep ran with SpecPrefill on (ppTPS 2496 at 16K), so MTP was
+decoding against a cache holding ~20% of tokens — roughly 3.3K at the 16K row —
+while DFlash decoded against the full 16.4K and still won. Against that, sparse
+context may itself depress MTP's acceptance. The clean test is DFlash+SpecPrefill
+against MTP+SpecPrefill, which nothing prevents (see below).
+
+**A prediction recorded here earlier — that MTP's lead would widen with context,
+since it is one layer over the KV against DFlash's six — was wrong.** It is kept
+in this note rather than deleted: the reasoning was plausible and still wrong,
+because it counted drafter cost and ignored draft-block size.
+
+**Open:** the 32K row breaks the trend (70.1 → 49.4 at 27.8 GB peak). Either
+acceptance falls past 16K or something else changes. One point at 64K would say
+whether DFlash's advantage is a 8–16K window or a general property.
 
 ### DSpark: matched, but no MLX runtime
 
