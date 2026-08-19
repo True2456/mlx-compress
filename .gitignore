@@ -11,6 +11,9 @@ artifacts/**
 !artifacts/hf_card_*.md
 !artifacts/omlx_patches/
 !artifacts/omlx_patches/**
+# ANE probe scripts + captured ground truth cited by docs/ANE-M5-MAX.md
+!artifacts/ane_probes/
+!artifacts/ane_probes/**
 calib/**
 !calib/.gitkeep
 # never commit multi-hundred-GB weights

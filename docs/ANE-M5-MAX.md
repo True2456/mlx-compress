@@ -250,7 +250,7 @@ Plus, from the MLX-side patch:
 Probed 2026-08-19 with a synthetic Qwen3.8-shaped MLP (H=5120, I=17408, 4-bit
 affine gs64) driven through `_compile_pair` and `_backend` directly at S=4096.
 Two independent runs, 7 iterations each, median reported. Script:
-`artifacts/ane_dual_probe.py`.
+`artifacts/ane_probes/ane_dual_probe.py`.
 
 At `fraction=0.53`, `alignment=128` (dual) gives `ane_outputs=9216`,
 `gpu_outputs=8192`.
@@ -478,12 +478,12 @@ App Store distribution.
 The guesswork in the previous revision is replaced by ground truth. lldb cannot
 attach (the bundled Python is hardened without `get-task-allow`), so the
 arguments were captured by **swizzling the method from inside the process** with
-ctypes — no debugger, no entitlements. Harness: `artifacts/swizzle_capture.py`,
-`artifacts/swizzle_compile.py`, `artifacts/dump_blobs.py`.
+ctypes — no debugger, no entitlements. Harness: `artifacts/ane_probes/swizzle_capture.py`,
+`artifacts/ane_probes/swizzle_compile.py`, `artifacts/ane_probes/dump_blobs.py`.
 
 ### The full MIL template
 
-`artifacts/ane_captured/mil.txt`, emitted by `qwen35_ane_compile_linear` for a
+`artifacts/ane_probes/captured/mil.txt`, emitted by `qwen35_ane_compile_linear` for a
 128x64 fp32 weight at S=1024:
 
 ```
@@ -515,7 +515,7 @@ programs returned a nil descriptor.
 | `weights` | NSDictionary | key = the full `BLOBFILE` path string; value = `{ data: NSData, offset: NSNumber }` |
 | `optionsPlist` | NSData | **zero bytes** — no keys required |
 
-Blob layout (`artifacts/ane_captured/*.bin`): 64-byte header
+Blob layout (`artifacts/ane_probes/captured/*.bin`): 64-byte header
 `01000000 02000000` followed by 56 zero bytes, payload at offset 64, trailing
 padding to a 64-byte boundary. `weight_data.bin` is 8320 bytes for 128x64 int8;
 `weight_scale.bin` is 384 bytes for 128 fp16.

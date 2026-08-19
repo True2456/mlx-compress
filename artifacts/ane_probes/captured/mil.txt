@@ -1,0 +1,15 @@
+program(1.3)
+[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+{
+  func main<ios18>(tensor<fp16, [1, 64, 1, 1024]> x) {
+    tensor<int8, [128, 64, 1, 1]> wd = const()[name=string("wd"), val=tensor<int8, [128, 64, 1, 1]>(BLOBFILE(path=string("@model_path/weights/weight_data.bin"), offset=uint64(64)))];
+    tensor<fp16, [128, 1, 1, 1]> ws = const()[name=string("ws"), val=tensor<fp16, [128, 1, 1, 1]>(BLOBFILE(path=string("@model_path/weights/weight_scale.bin"), offset=uint64(64)))];
+    tensor<fp16, [128, 64, 1, 1]> w = constexpr_blockwise_shift_scale(data=wd, scale=ws)[name=string("dequant")];
+    string pt = const()[name=string("pt"), val=string("valid")];
+    tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+    tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+    tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+    int32 gr = const()[name=string("gr"), val=int32(1)];
+    tensor<fp16, [1, 128, 1, 1024]> y = conv(dilations=dl, groups=gr, pad=pd, pad_type=pt, strides=st, weight=w, x=x)[name=string("conv")];
+  } -> (y);
+}
