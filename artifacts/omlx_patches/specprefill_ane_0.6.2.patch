@@ -1,0 +1,149 @@
+--- a/omlx/model_settings.py	2026-08-19 18:33:55
++++ b/omlx/model_settings.py	2026-08-19 18:34:25
+@@ -125,6 +125,11 @@
+         specprefill_draft_model: Path to draft model for SpecPrefill.
+         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
+         specprefill_threshold: Min tokens to trigger SpecPrefill.
++        specprefill_ane_enabled: Compile the SpecPrefill draft model onto the
++            Apple Neural Engine so token scoring runs there instead of the GPU,
++            leaving the GPU free for target prefill. Requires a 4/5-bit affine
++            gs64/128 drafter -- bf16 drafts are rejected by _affine_spec and
++            silently stay on GPU.
+         dflash_enabled: Enable DFlash speculative decoding.
+         dflash_draft_model: Path/repo for DFlash draft checkpoint.
+         dflash_draft_quant_enabled: Enable draft model quantization.
+@@ -230,6 +235,7 @@
+     )
+     specprefill_keep_pct: Optional[float] = None  # Keep rate (0.1-0.5, default 0.2)
+     specprefill_threshold: Optional[int] = None  # Min tokens to trigger (default 8192)
++    specprefill_ane_enabled: bool = False  # Score on ANE (needs 4/5-bit gs64/128 draft)
+ 
+     # DFlash (block diffusion speculative decoding)
+     dflash_enabled: bool = False
+--- a/omlx/model_profiles.py	2026-08-19 18:33:55
++++ b/omlx/model_profiles.py	2026-08-19 18:34:25
+@@ -77,6 +77,7 @@
+     "specprefill_draft_model",
+     "specprefill_keep_pct",
+     "specprefill_threshold",
++    "specprefill_ane_enabled",
+     "index_cache_freq",
+ )
+ 
+--- a/omlx/admin/routes.py	2026-08-19 18:33:55
++++ b/omlx/admin/routes.py	2026-08-19 18:34:25
+@@ -143,6 +143,7 @@
+     qwen35_ane_prefill_gdn: bool | None = None
+     qwen35_ane_prefill_gdn_fraction: float | None = None
+     qwen35_ane_prefill_gdn_max_layers: int | None = None
++    specprefill_ane_enabled: bool | None = None
+     # SpecPrefill (experimental)
+     specprefill_enabled: bool | None = None
+     specprefill_draft_model: str | None = None
+--- a/omlx/admin/static/js/dashboard.js	2026-08-19 18:33:55
++++ b/omlx/admin/static/js/dashboard.js	2026-08-19 18:34:25
+@@ -36,6 +36,7 @@
+         'qwen35_ane_prefill_gdn',
+         'qwen35_ane_prefill_gdn_fraction',
+         'qwen35_ane_prefill_gdn_max_layers',
++        'specprefill_ane_enabled',
+         'specprefill_enabled',
+         'specprefill_draft_model',
+         'specprefill_keep_pct',
+@@ -214,6 +215,7 @@
+                 max_tool_result_tokens: null,
+                 ctKwargEntries: [],
+                 is_diffusion_model: false,
++                specprefill_ane_enabled: false,
+                 qwen35_ane_prefill_enabled: false,
+                 qwen35_ane_prefill_sequence_length: 2048,
+                 qwen35_ane_prefill_fraction: 0.53,
+--- a/omlx/admin/templates/dashboard/_modal_model_settings.html	2026-08-19 18:33:55
++++ b/omlx/admin/templates/dashboard/_modal_model_settings.html	2026-08-19 18:34:25
+@@ -973,6 +973,19 @@
+                                             </select>
+                                             <p class="text-xs text-neutral-400 mt-1">Small model sharing tokenizer with target (e.g. Qwen3.5-0.8B for 35B)</p>
+                                         </div>
++                                        <div class="flex items-start justify-between gap-3">
++                                            <div class="min-w-0">
++                                                <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.specprefill_ane') }}</span>
++                                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.specprefill_ane_hint') }}</p>
++                                            </div>
++                                            <button type="button"
++                                                    @click="modelSettings.specprefill_ane_enabled = !modelSettings.specprefill_ane_enabled"
++                                                    :class="modelSettings.specprefill_ane_enabled ? 'bg-black' : 'bg-neutral-200'"
++                                                    class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
++                                                <span :class="modelSettings.specprefill_ane_enabled ? 'translate-x-5' : 'translate-x-0'"
++                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
++                                            </button>
++                                        </div>
+                                         <div>
+                                             <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Keep Rate</label>
+                                             <select x-model="modelSettings.specprefill_keep_pct"
+--- a/omlx/engine/batched.py	2026-08-19 18:33:55
++++ b/omlx/engine/batched.py	2026-08-19 18:34:25
+@@ -570,6 +570,64 @@
+                             # thread". Same root cause and fix as e93c408
+                             # for the VLM MTP drafter.
+                             materialize_lazy_state(draft_model)
++
++                            # Score on the ANE instead of the GPU when asked.
++                            # The drafter must be 4/5-bit affine gs64/128:
++                            # _affine_spec rejects bf16, in which case
++                            # enable_qwen35_ane_prefill returns 0 and scoring
++                            # stays on GPU without raising.
++                            if getattr(
++                                self._model_settings, "specprefill_ane_enabled", False
++                            ):
++                                try:
++                                    from ..patches.qwen35_ane_prefill import (
++                                        _install_dispatch,
++                                        enable_qwen35_ane_prefill,
++                                    )
++
++                                    _install_dispatch()
++                                    lm_draft = getattr(
++                                        draft_model, "language_model", draft_model
++                                    )
++                                    ane_count = enable_qwen35_ane_prefill(
++                                        lm_draft,
++                                        sequence_length=int(
++                                            getattr(
++                                                self._model_settings,
++                                                "qwen35_ane_prefill_sequence_length",
++                                                4096,
++                                            )
++                                        ),
++                                        fraction=float(
++                                            getattr(
++                                                self._model_settings,
++                                                "qwen35_ane_prefill_fraction",
++                                                0.53,
++                                            )
++                                        ),
++                                        dual_ane=getattr(
++                                            self._model_settings,
++                                            "qwen35_ane_prefill_dual_ane",
++                                            True,
++                                        ),
++                                    )
++                                    if ane_count:
++                                        logger.info(
++                                            "SpecPrefill draft model compiled %d "
++                                            "procedures onto the ANE",
++                                            ane_count,
++                                        )
++                                    else:
++                                        logger.warning(
++                                            "SpecPrefill ANE requested but the drafter "
++                                            "is not eligible (needs 4/5-bit affine "
++                                            "gs64/128); scoring stays on GPU"
++                                        )
++                                except Exception:
++                                    logger.warning(
++                                        "SpecPrefill draft model ANE compilation failed",
++                                        exc_info=True,
++                                    )
+                             return draft_model
+                         finally:
+                             set_mtp_active(was_mtp)
